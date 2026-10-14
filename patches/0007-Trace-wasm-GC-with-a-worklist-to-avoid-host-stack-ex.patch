@@ -1,0 +1,86 @@
+From b1c50b98e53cba3f1ec30b47df873f2cc3dad415 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 09:16:57 -0700
+Subject: [PATCH 07/16] Trace wasm GC with a worklist to avoid host stack
+ exhaustion
+
+---
+ CHANGES-wasm-port.md |  5 +++++
+ Core/Src/UnObj.cpp   | 30 ++++++++++++++++--------------
+ 2 files changed, 21 insertions(+), 14 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 9e5cf0c..9fe485b 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -133,3 +133,8 @@ exit=1
+ - Baseline command: `env -u WASM_SKIP_GC UT2004_BASE="$PWD/data3369/UT2004/System" node build/ut2004.js`; transcript `build/logs/phase2c-baseline-system.log` reproduces `RangeError: Maximum call stack size exceeded` at the first map GC. Initial extraction-root attempt (`phase2c-baseline.log`) fails MissingIni.
+ - Parent recipe incoming changes enable C++ exceptions and use a 256 MiB linear-memory stack. These are distinct from Node/V8's native call-stack limit; diagnosis will measure actual GC depth.
+ - First depth probe (`phase2c-gc-depth.log`) reaches depth 2000, not 50000. Corrected the incoming diagnostic's invalid `*GetFullName()` dereference: GetFullName returns TCHAR*, so ANSI conversion needs the pointer. Empty names were a probe bug, not evidence of corrupted object names.
++- Temporary evidence-only probe audits all Next/Children owners and sibling-chain cycles; records pre-purge reachability of every object/name for recursive-versus-worklist comparison, immediate parent at depth milestones, and maximum completed depth. Probe patch and captures retained under build; removed before final commit. Increasing only Node --stack-size=4096 completes GC and hits the socket fatal (`phase2c-gc-node-stack4096.log`).
++- Root cause measured: 19,950 fields; no Next/Children ownership errors or sibling cycles; largest sibling chain 562 (Engine.PlayerController), maximum recursive graph depth 2629. This is legitimate depth-first graph traversal across field and class references, not a 50k-node mis-linked list. The same engine algorithm is recursively stack-bound on native too, but no native game failure has been demonstrated; the observed failure is Node/V8 host-stack exhaustion.
++- `Core/Src/UnObj.cpp`: Emscripten FArchiveTagUsed uses a TArray worklist drained at the outermost reference. RF_Unreachable is still cleared before scheduling, RF_EliminateObject still nulls references, RF_DebugSerialize is checked after serialization, and each queued object/name is traced before root processing returns. Native recursion remains verbatim. Removes the now-obsolete recursive depth probes after capturing them in commit 491b6c6. Both CollectGarbage and IsReferenced use this archive.
++- Differential regression: recursive archive with Node --stack-size=4096 and worklist archive with default Node stack yield byte-identical pre-purge dumps of 50,971 entries: 20,779 reachable objects, 168 unreachable objects, 29,889 reachable names, 135 unreachable names. Both proceed to the same socket fatal. Captures: `phase2c-recursive-reachability.txt`, `phase2c-worklist-reachability.txt`, `phase2c-gc-comparison.txt`, plus boot logs; temporary audit removed.
++- Saved 2000-frame path contains 1955 Next edges, 17 Children, 10 SuperField, one Class, and 16 other references. Example valid crossings: Actor.MessageClass → LocalMessage; GameInfo.VehicleList → Vehicle → Pawn; Pawn.LastHitBy → Controller; LevelInfo.ReplicationViewer → PlayerController. Object/class property serializers and script references connect the independently valid sibling lists. Loader ULinkerLoad::operator<< resolves stored package indices via IndexToObject; UField/UStruct deserialize Next/Children directly. No loader correction is justified.
+diff --git a/Core/Src/UnObj.cpp b/Core/Src/UnObj.cpp
+index 7b0ebef..d3168ae 100644
+--- a/Core/Src/UnObj.cpp
++++ b/Core/Src/UnObj.cpp
+@@ -4944,6 +4944,9 @@ void UObject::SerializeRootSet( FArchive& Ar, DWORD KeepFlags, DWORD RequiredFla
+ class FArchiveTagUsed : public FArchive
+ {
+ 	FName LevelName, UdpGamespyQueryName;
++#if defined(__EMSCRIPTEN__)
++	TArray<UObject*> PendingObjects;
++#endif
+ public:
+ 	FArchiveTagUsed()
+ 	: Context( NULL )
+@@ -4995,31 +4998,30 @@ private:
+ 			// Recurse.
+ 			if( Obj->GetFlags() & RF_TagGarbage )
+ 			{
+-				// Recurse down the object graph.
+ #if defined(__EMSCRIPTEN__)
+-				static INT GTagDepth = 0;
+-				static INT GTagMaxDepth = 0;
+-				static long long GTagVisits = 0;
+-				++GTagDepth; ++GTagVisits;
+-				if( GTagDepth > GTagMaxDepth )
++				// Claim before enqueueing; valid field graphs exceed the host call stack.
++				PendingObjects.AddItem( Obj );
++				if( !Context )
+ 				{
+-					GTagMaxDepth = GTagDepth;
+-					if( (GTagDepth < 10000 && GTagDepth % 1000 == 0) || GTagDepth % 25000 == 0 )
++					while( PendingObjects.Num() )
+ 					{
+-						fprintf(stderr, "[gc] depth=%d visits=%lld obj=%s\n", GTagDepth, GTagVisits, TCHAR_TO_ANSI(Obj->GetFullName()));
+-						fflush(stderr);
++						UObject* Current = PendingObjects.Pop();
++						Context = Current;
++						Current->Serialize( *this );
++						if( !(Current->GetFlags() & RF_DebugSerialize) )
++							appErrorf( TEXT("%s failed to route Serialize"), Current->GetFullName() );
++						Context = NULL;
+ 					}
+ 				}
+-#endif
++#else
++				// Recurse down the object graph.
+ 				UObject* OriginalContext = Context;
+ 				Context = Obj;
+ 				Obj->Serialize( *this );
+-#if defined(__EMSCRIPTEN__)
+-				--GTagDepth;
+-#endif
+ 				if( !(Obj->GetFlags() & RF_DebugSerialize) )
+ 					appErrorf( TEXT("%s failed to route Serialize"), Obj->GetFullName() );
+ 				Context = OriginalContext;
++#endif
+ 			}
+ 			else
+ 			{
+-- 
+2.47.3
+

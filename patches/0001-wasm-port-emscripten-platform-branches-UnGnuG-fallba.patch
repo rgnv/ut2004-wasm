@@ -1,0 +1,100 @@
+From ec2638b2189f1025dff86565640a44210269ebdd Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Tue, 13 Oct 2026 07:50:01 -0700
+Subject: [PATCH 01/16] wasm port: emscripten platform branches (UnGnuG),
+ fallback rotates/timer, GNUSTATIC fix
+
+---
+ Core/Inc/UnGnuG.h     | 32 ++++++++++++++++++++++++++++++++
+ Core/Inc/UnTemplate.h |  2 +-
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/Core/Inc/UnGnuG.h b/Core/Inc/UnGnuG.h
+index ed2be5f..7633e51 100644
+--- a/Core/Inc/UnGnuG.h
++++ b/Core/Inc/UnGnuG.h
+@@ -27,6 +27,15 @@
+ 		#define ASMLINUX 1
+ 		#define COMPILER "Compiled with GNU g++ ("__VERSION__")"
+ 	#endif
++#elif defined(__EMSCRIPTEN__)
++	#define __UNIX__  1
++	#define __LINUX__ 1
++	#define __INTEL_BYTE_ORDER__ 1
++	#undef ASM
++	#undef ASM3DNOW
++	#undef ASMKNI
++	#undef ASMLINUX
++	#define COMPILER "Compiled with Emscripten clang ("__VERSION__")"
+ #elif (defined MACOSX)
+ 	#define __UNIX__  1
+ 	#undef ASM
+@@ -243,8 +252,10 @@ typedef unsigned long PTRINT;
+ 
+ // !!! FIXME: This should really just include a header.
+ #if ((!defined MACOSX) && (!defined __x86_64__))
++#if !defined(__EMSCRIPTEN__)
+ typedef unsigned int size_t;
+ #endif
++#endif
+ 
+ // Make sure characters are signed.
+ #ifdef __CHAR_UNSIGNED__
+@@ -655,6 +666,12 @@ inline DWORD _rotr(DWORD val, INT shift)
+     asm("rorl %%cl, %%eax" : "=a" (retval) : "a" (val), "c" (shift));
+ 	return retval;
+ }
++#elif defined(__EMSCRIPTEN__)
++inline DWORD _rotr(DWORD val, INT shift)
++{
++	shift &= 31;
++	return (val >> shift) | (val << ((32 - shift) & 31));
++}
+ #elif MACOSX
+ #include <stdio.h>
+ inline DWORD _rotr(DWORD val, INT shift)
+@@ -685,6 +702,12 @@ inline DWORD _rotl(DWORD val, INT shift)
+     asm("roll %%cl, %%eax" : "=a" (retval) : "a" (val), "c" (shift));
+ 	return retval;
+ }
++#elif defined(__EMSCRIPTEN__)
++inline DWORD _rotl(DWORD val, INT shift)
++{
++	shift &= 31;
++	return (val << shift) | (val >> ((32 - shift) & 31));
++}
+ #elif MACOSX
+ inline DWORD _rotl(DWORD val, INT shift)
+ {
+@@ -720,6 +743,15 @@ inline void appResetTimer(void)
+               "=d" ( ((DWORD *) &GBaseCycles)[1] )
+     );
+ }
++#elif defined(__EMSCRIPTEN__)
++#define DEFINED_appResetTimer 1
++#include <time.h>
++inline void appResetTimer(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	GBaseCycles = ((QWORD)ts.tv_sec) * 1000000000ULL + ((QWORD)ts.tv_nsec);
++}
+ #elif MACOSX
+ #define DEFINED_appResetTimer 1
+ inline void appResetTimer(void)
+diff --git a/Core/Inc/UnTemplate.h b/Core/Inc/UnTemplate.h
+index 0b2c456..850e474 100644
+--- a/Core/Inc/UnTemplate.h
++++ b/Core/Inc/UnTemplate.h
+@@ -778,7 +778,7 @@ public:
+ // Array operator news.
+ //
+ // !!! FIXME: This...is scary.  --ryan.
+-#if __GNUC__
++#if __GNUC__ && !defined(__EMSCRIPTEN__)
+ #define GNUSTATIC static
+ #else
+ #define GNUSTATIC
+-- 
+2.47.3
+

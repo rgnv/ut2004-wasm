@@ -1,0 +1,314 @@
+From 094b2f37492d51f0f1be85b021447f4a7fe321ef Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 10:21:11 -0700
+Subject: [PATCH 11/16] Render bounded browser client frames through SDL3 and
+ GL4ES
+
+---
+ CHANGES-wasm-port.md                          | 33 +++++++++++++++++++
+ Launch/Src/LaunchEmscripten.cpp               | 27 ++++++++++++++-
+ Launch/Src/wasm-registry.py                   |  5 +--
+ OpenGLDrv/Src/OpenGLRenderDevice.cpp          | 20 +++++++++--
+ OpenGLDrv/Src/OpenGLRenderInterface.cpp       |  4 +++
+ .../video/emscripten/SDL_emscriptenopengles.c |  4 +++
+ SDLDrv/Src/SDLClient.cpp                      |  4 +++
+ SDLDrv/Src/SDLViewport.cpp                    | 25 +++++++++++++-
+ XInterface/Src/XInterface.cpp                 |  2 +-
+ 9 files changed, 117 insertions(+), 7 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index a612d70..d9dfefc 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -188,3 +188,36 @@ exit=1
+   the 3a-style plain worker throws `ReferenceError: window is not defined` from
+   its system-theme Window access. Engine rendering remains deferred pending
+   main-thread dispatch/context ownership; no map-rendering claim.
++
++
++## Phase 3c — real browser renderer first frames (2026-10-13)
++
++- Browser-only `UT2004_WEB_CLIENT` startup selects SDLDrv/OpenGLDrv in ephemeral
++  config, enables script execution after `appInit`, enables rendering during six
++  fixed-delta ticks, then emits the existing browser bounded-loop marker.
++  Node keeps its original headless three-tick path and four registry modules.
++- Static registry generator accepts extra browser modules: SDLDrv, OpenGLDrv,
++  XGame and XInterface. XInterface's Emscripten name registration runs after core
++  initialization, rather than from its pre-runtime global constructor.
++- SDLDrv's guarded browser path checks SDL3's boolean init result, creates a
++  GLES2 opaque context, avoids software-surface access and automatic relative
++  mouse capture, and initializes GL4ES. Desktop GL lookup uses GL4ES's resolver.
++- Bundled SDL Emscripten context preserves the drawing buffer because engine
++  presents are deferred across browser yields. OpenGLRenderDevice owns browser
++  swaps. SDL context/window cleanup waits for shared renderer shutdown, fixing
++  texture deletion after context destruction.
++- Guarded renderer evidence counts default-framebuffer color clears and GL
++  errors and captures each Present before swap. Parent browser harness records
++  full readback statistics, unmodified canvas PNG and full-page screenshot.
++- Parent web link uses Asyncify and an asynchronous ranged HTTP filesystem on
++  the main thread, with suspension at the WASI read boundary. Full data tree
++  remains available; config writes stay in MEMFS. No source GL4ES changes.
++- Acceptance: NvidiaLogo map load, four presents across six ticks, two color
++  clears, 1024x768 final readback with 43,685 nonblack pixels/50 colors, zero GL
++  and page errors, bounded marker and clean exit. Screenshot shows dim initial
++  Nvidia logo fade. Evidence and exact commands: parent `build/phase3c/` and
++  `docs/phase3-report.md`.
++- Node regression passes full boot, mount-only, invalid-argument rejection,
++  166 wasm objects, saved GC differential and five original data/config hashes.
++  No interactive input/audio, arbitrary maps, native platform build or
++  multiplayer validation claimed.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 5d3b432..21a8546 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -1,4 +1,4 @@
+-// Headless Node/browser smoke boot: use the console startup path without UCC's editor modules.
++// Headless Node smoke boot and bounded browser client, without UCC editor modules.
+ #if defined(__EMSCRIPTEN__)
+ #include "Engine.h"
+ #include "UnLinker.h"
+@@ -10,6 +10,10 @@
+ #include <unistd.h>
+ #include <emscripten.h>
+ 
++#if defined(UT2004_WEB_CLIENT)
++extern "C" void RegisterNamesXInterface(void);
++#endif
++
+ INT GFilesOpen, GFilesOpened;
+ extern "C" { TCHAR GPackage[] = TEXT("Launch"); }
+ 
+@@ -49,10 +53,23 @@ int main(int argc, char** argv)
+     static FFeedbackContextAnsi Warn;
+     strcpy(GModule, "ut2004-wasm");
+     GIsStarted = 1;
++#if defined(UT2004_WEB_CLIENT)
++    GIsClient = 1;
++#else
+     GIsClient = 0;
++#endif
+     GIsServer = 1;
+     GIsEditor = 0;
+     appInit(TEXT("UT2004"), TEXT("-nohomedir -nosound"), &Malloc, &Log, &Error, &Warn, &Files, FConfigCacheIni::Factory, 1);
++#if defined(UT2004_WEB_CLIENT)
++    RegisterNamesXInterface();
++    GIsScriptable = 1;
++    GConfig->SetString(TEXT("Engine.Engine"), TEXT("ViewportManager"), TEXT("SDLDrv.SDLClient"));
++    GConfig->SetString(TEXT("Engine.Engine"), TEXT("RenderDevice"), TEXT("OpenGLDrv.OpenGLRenderDevice"));
++    GConfig->SetBool(TEXT("SDLDrv.SDLClient"), TEXT("StartupFullscreen"), 0);
++    GConfig->SetInt(TEXT("SDLDrv.SDLClient"), TEXT("WindowedViewportX"), 640);
++    GConfig->SetInt(TEXT("SDLDrv.SDLClient"), TEXT("WindowedViewportY"), 480);
++#endif
+     FName(NAME_Init).ClearFlags(RF_Suppress);
+     FName(NAME_DevLoad).ClearFlags(RF_Suppress);
+     debugf(NAME_Init, TEXT("WASM: Core init complete"));
+@@ -87,7 +104,15 @@ int main(int argc, char** argv)
+         UEngine* Engine = ConstructObject<UEngine>(EngineClass);
+         Engine->Init();
+         debugf(NAME_Init, TEXT("WASM: engine initialized"));
++#if defined(UT2004_WEB_CLIENT)
++        GIsRunning = 1;
++        INT Frame = 0;
++        for (; Frame < 6 && !GIsRequestingExit; ++Frame) Engine->Tick(1.0f / 60.0f);
++        GIsRunning = 0;
++        debugf(NAME_Init, TEXT("WASM: browser ticks=%i"), Frame);
++#else
+         for (INT Frame = 0; Frame < 3 && !GIsRequestingExit; ++Frame) Engine->Tick(1.0f / 60.0f);
++#endif
+         if (emscripten_run_script_int("typeof window !== 'undefined' || typeof importScripts === 'function'"))
+             debugf(NAME_Init, TEXT("WASM: browser bounded loop complete"));
+         else
+diff --git a/Launch/Src/wasm-registry.py b/Launch/Src/wasm-registry.py
+index 21251c6..5f8e7cf 100644
+--- a/Launch/Src/wasm-registry.py
++++ b/Launch/Src/wasm-registry.py
+@@ -7,8 +7,9 @@ import sys
+ out = ['#if defined(__EMSCRIPTEN__)', '#include "Core.h"',
+        'struct FWasmExport { const char* Name; void* Address; };']
+ modules = []
+-for module in ("Core", "Engine", "IpDrv", "UWeb"):
+-    objects = sorted(pathlib.Path(sys.argv[1], module.lower()).glob("*.o"))
++for spec in ["Core", "Engine", "IpDrv", "UWeb"] + sys.argv[3:]:
++    module, _, directory = spec.partition(":")
++    objects = sorted(pathlib.Path(sys.argv[1], (directory or module.lower())).glob("*.o"))
+     assert objects, module
+     symbols = subprocess.check_output(
+         ["/emsdk/upstream/bin/llvm-nm", "--defined-only", "--format=posix", *map(str, objects)],
+diff --git a/OpenGLDrv/Src/OpenGLRenderDevice.cpp b/OpenGLDrv/Src/OpenGLRenderDevice.cpp
+index 147acfb..6caba27 100644
+--- a/OpenGLDrv/Src/OpenGLRenderDevice.cpp
++++ b/OpenGLDrv/Src/OpenGLRenderDevice.cpp
+@@ -8,6 +8,12 @@
+ =============================================================================*/
+ 
+ #include "OpenGLDrv.h"
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++static INT WasmGLErrors = 0;
++INT GWasmColorClears = 0;
++extern "C" void* gl4es_GetProcAddress(const char*);
++#endif
+ 
+ /*-----------------------------------------------------------------------------
+ 	Constants & static stuff.
+@@ -137,7 +143,11 @@ void UOpenGLRenderDevice::FindProc( void*& ProcAddress, char* Name, char* Suppor
+ 
+ #if (defined USE_SDL)
+ 	if( !ProcAddress )
+-		ProcAddress = (void*) SDL_GL_GetProcAddress( Name );
++#if defined(__EMSCRIPTEN__)
++        ProcAddress = gl4es_GetProcAddress( Name );
++#else
++        ProcAddress = (void*) SDL_GL_GetProcAddress( Name );
++#endif
+ #elif (defined WIN32)
+ 	if( !ProcAddress )
+ 		ProcAddress = appGetDllExport( hModuleGLMain, appFromAnsi(Name) );
+@@ -216,7 +226,10 @@ void UOpenGLRenderDevice::GLError( TCHAR* Tag )
+ 	GLenum Error;
+ 	while( (Error=glGetError()) != GL_NO_ERROR )
+ 	{
+-		const TCHAR* Msg;
++#if defined(__EMSCRIPTEN__)
++        ++WasmGLErrors;
++#endif
++        const TCHAR* Msg;
+ 		switch( Error )
+ 		{
+ 			case GL_INVALID_ENUM:
+@@ -1479,6 +1492,9 @@ void UOpenGLRenderDevice::Present(UViewport* Viewport)
+ #endif
+ 
+ #if defined(__EMSCRIPTEN__)
++    glFinish();
++    GLError(TEXT("WASM frame present"));
++    EM_ASM({ Module.captureFrame($0, $1); }, WasmGLErrors, GWasmColorClears);
+ 	SDL_GL_SwapWindow( SDL_GL_GetCurrentWindow() );
+ #elif (defined USE_SDL)
+ 	SDL_GL_SwapBuffers();
+diff --git a/OpenGLDrv/Src/OpenGLRenderInterface.cpp b/OpenGLDrv/Src/OpenGLRenderInterface.cpp
+index 073c011..77d1cd4 100644
+--- a/OpenGLDrv/Src/OpenGLRenderInterface.cpp
++++ b/OpenGLDrv/Src/OpenGLRenderInterface.cpp
+@@ -261,6 +261,10 @@ void FOpenGLRenderInterface::Clear(UBOOL UseColor,FColor Color,UBOOL UseDepth,FL
+ 	}
+ 
+ 	RenDev->glClear( ClearFlags );
++#if defined(__EMSCRIPTEN__)
++    extern INT GWasmColorClears;
++    if (UseColor && !CurrentState->OtherRenderTarget) ++GWasmColorClears;
++#endif
+ 
+ 	unguard;
+ }
+diff --git a/SDL/src/video/emscripten/SDL_emscriptenopengles.c b/SDL/src/video/emscripten/SDL_emscriptenopengles.c
+index 39faf2f..52a8b80 100644
+--- a/SDL/src/video/emscripten/SDL_emscriptenopengles.c
++++ b/SDL/src/video/emscripten/SDL_emscriptenopengles.c
+@@ -89,6 +89,10 @@ SDL_GLContext Emscripten_GLES_CreateContext(SDL_VideoDevice *_this, SDL_Window *
+ 
+     emscripten_webgl_init_context_attributes(&attribs);
+ 
++#if defined(__EMSCRIPTEN__)
++    // UT2004 presents the previous frame and can yield for HTTP reads while drawing.
++    attribs.preserveDrawingBuffer = true;
++#endif
+     attribs.alpha = _this->gl_config.alpha_size > 0;
+     attribs.depth = _this->gl_config.depth_size > 0;
+     attribs.stencil = _this->gl_config.stencil_size > 0;
+diff --git a/SDLDrv/Src/SDLClient.cpp b/SDLDrv/Src/SDLClient.cpp
+index 999b568..0746407 100644
+--- a/SDLDrv/Src/SDLClient.cpp
++++ b/SDLDrv/Src/SDLClient.cpp
+@@ -89,7 +89,11 @@ void USDLClient::Init( UEngine* InEngine )
+ 	// Init base.
+ 	UClient::Init( InEngine );
+ 
++#if defined(__EMSCRIPTEN__)
++    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK))
++#else
+     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK) == -1)
++#endif
+     {
+         const TCHAR *err = appFromAnsi(SDL_GetError());
+ 		appErrorf(TEXT("Couldn't initialize SDL: %s\n"), err);
+diff --git a/SDLDrv/Src/SDLViewport.cpp b/SDLDrv/Src/SDLViewport.cpp
+index 4826893..3ca3de1 100644
+--- a/SDLDrv/Src/SDLViewport.cpp
++++ b/SDLDrv/Src/SDLViewport.cpp
+@@ -16,6 +16,9 @@ Revision history:
+ #include <fcntl.h>
+ 
+ #include "SDLDrv.h"
++#if defined(__EMSCRIPTEN__)
++extern "C" void initialize_gl4es(void);
++#endif
+ 
+ // Duplicated here for convenience.
+ enum EEditorMode
+@@ -535,11 +538,25 @@ void USDLViewport::OpenWindow( PTRINT InParentWindow, UBOOL IsTemporary, INT New
+ {
+ 	guard(USDLViewport::OpenWindow);
+ 
++#if defined(__EMSCRIPTEN__)
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
++    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
++#endif
+ 	Window = SDL_CreateWindow("NULL", 640, 480, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+ 	Context = SDL_GL_CreateContext(Window);
++#if !defined(__EMSCRIPTEN__)
+ 	ScreenSurface = SDL_GetWindowSurface(Window); // This function must be called every time window resised
+ 	SDL_GL_MakeCurrent(Window, Context);
+ 	SDL_SetWindowRelativeMouseMode(Window, true); // Maybe i need move this to another location
++#else
++    if (!Window || !Context || !SDL_GL_MakeCurrent(Window, Context))
++        appErrorf(TEXT("WASM: SDL GL context failed: %s"), appFromAnsi(SDL_GetError()));
++    initialize_gl4es();
++    debugf(TEXT("WASM: SDL3 viewport and GL4ES context active"));
++#endif
+ 
+     // Can't do multiple windows with SDL 1.2.
+     // Eh...Splash screen. !!! FIXME.
+@@ -626,8 +643,12 @@ void USDLViewport::CloseWindow()
+ {
+ 	guard(USDLViewport::CloseWindow);
+ 	
++#if defined(__EMSCRIPTEN__)
++    // Shared renderer exits in SDLClient::Destroy; SDL_QuitSubSystem releases its context afterward.
++#else
+ 	SDL_DestroyWindow(Window);
+ 	SDL_GL_DestroyContext(Context);
++#endif
+ 
+ 	unguard;
+ }
+@@ -653,7 +674,9 @@ void USDLViewport::Repaint( UBOOL Blit )
+ {
+ 	guard(USDLViewport::Repaint);
+ 	GetOuterUSDLClient()->Engine->Draw( this, Blit );
+-	SDL_GL_SwapWindow(Window);
++#if !defined(__EMSCRIPTEN__)
++	SDL_GL_SwapWindow(Window); // Browser swaps belong to OpenGLRenderDevice::Present.
++#endif
+ 	unguard;
+ }
+ 
+diff --git a/XInterface/Src/XInterface.cpp b/XInterface/Src/XInterface.cpp
+index d6e7abe..d8ad2e9 100644
+--- a/XInterface/Src/XInterface.cpp
++++ b/XInterface/Src/XInterface.cpp
+@@ -39,7 +39,7 @@ void RegisterNamesXInterface()
+ 	#undef NAMES_ONLY
+ }
+ 
+-#if !__STATIC_LINK
++#if !__STATIC_LINK && !defined(__EMSCRIPTEN__)
+     struct FXInterfaceInitManager
+     {
+         FXInterfaceInitManager()
+-- 
+2.47.3
+

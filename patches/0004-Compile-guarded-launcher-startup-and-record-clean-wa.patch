@@ -1,0 +1,294 @@
+From 3347fabba442d120af130e9815da05fa8c36f210 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 08:12:09 -0700
+Subject: [PATCH 04/16] Compile guarded launcher startup and record clean wasm
+ acceptance
+
+---
+ CHANGES-wasm-port.md       | 29 ++++++++++++++++++++
+ Launch/Src/Helper.cpp      | 11 ++++++++
+ Launch/Src/Launch.cpp      | 56 ++++++++++++++++++++++++++++++++++++--
+ Launch/Src/LaunchPrivate.h |  4 +++
+ 4 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 1b0de31..a967819 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -35,3 +35,32 @@ Core validation: all 20 objects rebuilt successfully. `llvm-nm --undefined-only
+ - `Engine/Inc/UnNullRenderDevice.h`, includes: resolve private Engine header relative to current header on Emscripten.
+ - `Engine/Inc/UnPrim.h`, `CompareHits`: expose hidden friend at namespace scope on Emscripten so `MultiLineCheck` can pass existing comparator to qsort.
+ - `Engine/Src/UnTerrain.cpp`, integer `Compare`: forward-declare before template definition on Emscripten; built-in `int` has no ADL, existing sort and comparator unchanged.
++
++## Launch compilation boundary
++
++- `Launch/Src/LaunchPrivate.h`, includes: guard Windows SDK/resource/UI headers on Emscripten; retain Engine/render declarations.
++- `Launch/Src/Launch.cpp`, includes/globals: Emscripten selects existing ANSI allocator/error/feedback and Unix file manager; omits Windows instance, DbgHelp, DirectX headers.
++- `Launch/Src/Launch.cpp`, `GuardedMain`: compile existing startup logic as externally callable function accepting command line on Emscripten; guard Windows splash/log windows and route exec output to `GLog`; preserve CD-key and checksum checks, using equivalent `_WORD` for Windows `USHORT`.
++- `Launch/Src/Launch.cpp`, platform boundary: guard WinMain/SEH/minidumps; declare `InitEngine`/`MainLoop` for future platform implementations instead of including Windows implementation. Browser entry point, engine initialization and asynchronous loop are explicit unresolved phase-2 work, not fake success stubs. Existing empty hardware configuration function retained.
++- `Launch/Src/Helper.cpp`, `GetPrimaryAdapterVideoMemory`: Emscripten returns existing Win64 unknown-memory result (zero), without COM; native paths unchanged.
++
++## Final acceptance — 2026-10-13
++
++- [x] Full clean `./build-em.sh` completed with 148 `ok` lines, zero `FAIL` lines and final completion marker. Previous objects moved to `build/obj-before-clean` before rebuilding because harness does not track header dependencies.
++- [x] Objects match every harness file: core 20, engine 111, ipdrv 7, sdldrv 3, gldrv 5, launch 2 (148 total). All files carry WebAssembly version-1 magic.
++- [x] Every source change recorded above; build harness unchanged. Source changes confined to this repository and Emscripten branches.
++- [x] Changes committed in Core, Engine/drivers, and Launch chunks on `wasm-port`.
++- Build evidence: workspace `build/final-clean-build.txt`; symbol evidence: `build/final-symbol-check.txt`. Emscripten 6.0.12, Clang 24.0.0git in cached `emscripten/emsdk:latest` image.
++- Full object symbol scan has no undefined `operator new` for `TArray<FString>`. Launch exports real `GuardedMain(char*)` and instantiates its array placement new locally.
++- Initial `UnFPoly.cpp` compiler crash occurred during a shared-header write; retry and full clean rebuild passed without source changes to that file. Generated crash dump removed.
++- Compile blockers / unfixed files: **none**.
++
++### Phase-2 seed (not compile failures)
++
++- `Launch/Src/Launch.cpp`: `InitEngine()` and `MainLoop(UEngine*)` are intentionally undefined platform hooks, confirmed by symbol inspection. Windows implementations live in `Engine/Inc/UnEngineWin.h`; browser entry point and asynchronous lifecycle remain to be supplied. `GuardedMain` still contains synchronous startup/shutdown sequencing requiring integration in that phase.
++- `OpenGLDrv/Src/OpenGLRenderDevice.cpp`: SDL3/browser lacks legacy hardware gamma API; Emscripten omits gamma-ramp calls. Shader gamma and SDL3/GL browser compatibility remain runtime work.
++- `Core/Src/UnUnix.cpp`: execinfo stack traces unavailable; existing fallback selected. CPU timing/platform initialization, dynamic loading, filesystem, and networking behavior have not been runtime-validated.
++- `Launch/Src/Helper.cpp`: browser VRAM query returns unknown (zero), matching existing Win64 fallback.
++- `IpDrv/Src/UnSocket.cpp`: resolver values `TRY_AGAIN`/`NO_RECOVERY` overlap WASI errno values; diagnostic switch retains errno interpretations.
++
++No linking, browser execution or native build attempted; this phase establishes object compilation only.
+diff --git a/Launch/Src/Helper.cpp b/Launch/Src/Helper.cpp
+index 7a41278..b3c8f4a 100644
+--- a/Launch/Src/Helper.cpp
++++ b/Launch/Src/Helper.cpp
+@@ -6,6 +6,15 @@ Revision history:
+ 	* Created by Daniel Vogel.
+ =============================================================================*/
+ 
++#if defined(__EMSCRIPTEN__)
++#include "Core.h"
++
++// Browser exposes no adapter VRAM query; match existing Win64 unknown result.
++DWORD GetPrimaryAdapterVideoMemory()
++{
++	return 0;
++}
++#else
+ #define _WIN32_DCOM 1
+ 
+ #pragma pack(push,8)
+@@ -77,3 +86,5 @@ DWORD GetPrimaryAdapterVideoMemory()
+ 	The End.
+ -----------------------------------------------------------------------------*/
+ 
++
++#endif // __EMSCRIPTEN__
+diff --git a/Launch/Src/Launch.cpp b/Launch/Src/Launch.cpp
+index f2ce679..20b25da 100644
+--- a/Launch/Src/Launch.cpp
++++ b/Launch/Src/Launch.cpp
+@@ -7,9 +7,15 @@ Revision history:
+ =============================================================================*/
+ 
+ #include "LaunchPrivate.h"
++#if defined(__EMSCRIPTEN__)
++// Platform implementations belong to the link/runtime phase.
++UEngine* InitEngine();
++void MainLoop( UEngine* Engine );
++#else
+ #include "UnEngineWin.h"
++#endif
+ 
+-#ifndef _DEBUG
++#if !defined(_DEBUG) && !defined(__EMSCRIPTEN__)
+ #pragma pack(push,8)
+ #include <DbgHelp.h>
+ #pragma pack(pop)
+@@ -82,13 +88,15 @@ extern BYTE GLoadedPixoDrv;
+ -----------------------------------------------------------------------------*/
+ 
+ // General.
++#if !defined(__EMSCRIPTEN__)
+ extern "C" {HINSTANCE hInstance;}
++#endif
+ extern "C" {TCHAR GPackage[64]=TEXT("Launch");}
+ static void SetInitialConfiguration();
+ 
+ // Memory allocator.
+ // !!! FIXME: Why does FMallocWindows not work on Win64?  --ryan.
+-#ifdef _WIN64
++#if defined(_WIN64) || defined(__EMSCRIPTEN__)
+   #include <malloc.h>
+   #include "FMallocAnsi.h"
+   FMallocAnsi Malloc;
+@@ -106,6 +114,14 @@ static void SetInitialConfiguration();
+ #include "FOutputDeviceFile.h"
+ FOutputDeviceFile Log;
+ 
++#if defined(__EMSCRIPTEN__)
++#include "FOutputDeviceAnsiError.h"
++FOutputDeviceAnsiError Error;
++#include "FFeedbackContextAnsi.h"
++FFeedbackContextAnsi Warn;
++#include "FFileManagerUnix.h"
++FFileManagerUnix FileManager;
++#else
+ // Error handler.
+ #include "FOutputDeviceWindowsError.h"
+ FOutputDeviceWindowsError Error;
+@@ -118,6 +134,8 @@ FFeedbackContextWindows Warn;
+ #include "FFileManagerWindows.h"
+ FFileManagerWindows FileManager;
+ 
++#endif
++
+ // Config.
+ #include "FConfigCacheIni.h"
+ 
+@@ -129,8 +147,14 @@ FFileManagerWindows FileManager;
+ // Guarded main loop.
+ //
+ static TCHAR* CmdLine = NULL;
++#if defined(__EMSCRIPTEN__)
++void GuardedMain( TCHAR* InCmdLine )
++{
++	CmdLine = InCmdLine;
++#else
+ static void GuardedMain()
+ {
++#endif
+ 	// Init core.
+ 	GIsClient = 1;
+ 	appInit( GPackage, CmdLine, &Malloc, &Log, &Error, &Warn, &FileManager, FConfigCacheIni::Factory, 1 );
+@@ -235,7 +259,9 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ 	if( !ShowLog && !ParseParam(appCmdLine(),TEXT("server")) && !appStrfind(appCmdLine(),TEXT("TestRenDev")) )
+     {
+         debugf(TEXT("Splash screen filename is '%s'"), *Filename);
++#if !defined(__EMSCRIPTEN__)
+ 		InitSplash( *Filename );
++#endif
+     }
+ 
+ 	// Set sane default values on initial run.
+@@ -257,11 +283,14 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ 	// Exit if wanted.
+ 	if( GIsRequestingExit )
+ 	{
++#if !defined(__EMSCRIPTEN__)
+ 		ExitSplash();
++#endif
+ 		appPreExit();
+ 		return; // appExit will be called outside guarded code
+ 	}
+ 
++#if !defined(__EMSCRIPTEN__)
+ 	// Init windowing.
+ 	InitWindowing();
+ 
+@@ -272,6 +301,8 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ 	if( GIsClient )
+ 		SetPropX( *GLogWindow, TEXT("IsBrowser"), (HANDLE)1 );
+ 
++#endif
++
+ 	// Benchmarking/ movie recording.
+ 	GIsBenchmarking		= ParseParam(appCmdLine(),TEXT("BENCHMARK"));
+ 	GIsRecordingMovie	= ParseParam(appCmdLine(),TEXT("RECORDMOVIE"));
+@@ -402,9 +433,15 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ 				fn(1) = FString::Printf(TEXT("%s%s%s"),*fn(1),*fsB,*fsA);
+ 				fn(2) = FString::Printf(TEXT("%s%s%s"),*fn(2),*fsB,*fsA);
+ 
++#if defined(__EMSCRIPTEN__)
++				_WORD C = 0xFFFF;
++				_WORD T;
++				_WORD Q;
++#else
+ 				USHORT C = 0xFFFF;
+ 				USHORT T;
+ 				USHORT Q;
++#endif
+ 			
+ 				for (int i=0;i<fn.Num();i++)
+ 				{
+@@ -468,7 +505,9 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ 	if( !ValidateCDKey() )
+ 	{
+ 		GIsRequestingExit = 1;
++#if !defined(__EMSCRIPTEN__)
+ 		ExitSplash();
++#endif
+ 		appMsgf( 0, LocalizeError(TEXT("InvalidCDKey"),TEXT("Engine")) );
+ 	}
+ 	else
+@@ -482,10 +521,14 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ #endif
+ 			Engine->AnotherDummyFunctionToBreakCompatibility(1);
+ 			Engine->ReallyBreakCompatibility(1);
++#if !defined(__EMSCRIPTEN__)
+ 			GLogWindow->Log( NAME_Title, LocalizeGeneral(TEXT("Run"),GPackage) );
++#endif
+ 
+ 			// Hide splash screen.
++#if !defined(__EMSCRIPTEN__)
+ 			ExitSplash();
++#endif
+ 
+ 			// Optionally Exec an exec file
+ 			FString Temp;
+@@ -493,7 +536,11 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ 			{
+ 				Temp = FString(TEXT("exec ")) + Temp;
+ 				if( Engine->Client && Engine->Client->Viewports.Num() && Engine->Client->Viewports(0) )
++#if defined(__EMSCRIPTEN__)
++					Engine->Client->Viewports(0)->Exec( *Temp, *GLog );
++#else
+ 					Engine->Client->Viewports(0)->Exec( *Temp, *GLogWindow );
++#endif
+ 			}
+ 
+ 			// Start main engine loop, including the Windows message pump.
+@@ -504,12 +551,15 @@ sprintf(blah, "%d", (int) GLoadedPixoDrv);
+ 
+ 	// Clean shutdown.
+ 	GFileManager->Delete(TEXT("Running.ini"),0,0);
++#if !defined(__EMSCRIPTEN__)
+ 	RemovePropX( *GLogWindow, TEXT("IsBrowser") );
+ 	GLogWindow->Log( NAME_Title, LocalizeGeneral(TEXT("Exit"),GPackage) );
+ 	delete GLogWindow;
++#endif
+ 	appPreExit();
+ }
+ 
++#if !defined(__EMSCRIPTEN__)
+ //
+ // Exception handling.
+ //
+@@ -630,6 +680,8 @@ extern DWORD GetPrimaryAdapterVideoMemory();
+ #include "d3d9.h"
+ //#include "../../DirectX8/Inc/ddraw.h" //FIXME
+ //#include "../../DirectX8/Inc/d3d8.h"
++#endif
++
+ static void SetInitialConfiguration()
+ {
+ 	guard(SetInitialConfiguration);
+diff --git a/Launch/Src/LaunchPrivate.h b/Launch/Src/LaunchPrivate.h
+index c02d447..47560be 100644
+--- a/Launch/Src/LaunchPrivate.h
++++ b/Launch/Src/LaunchPrivate.h
+@@ -6,6 +6,7 @@ Revision history:
+ 	* Created by Tim Sweeney.
+ =============================================================================*/
+ 
++#if !defined(__EMSCRIPTEN__)
+ #pragma warning( disable : 4201 )
+ #define STRICT
+ #pragma pack(push,8)
+@@ -14,10 +15,13 @@ Revision history:
+ #include <process.h>
+ #include "Res\LaunchRes.h"
+ #pragma pack(pop)
++#endif
+ 
+ #include "Engine.h"
+ #include "UnRender.h"
++#if !defined(__EMSCRIPTEN__)
+ #include "Window.h"
++#endif
+ 
+ /*-----------------------------------------------------------------------------
+ 	The End.
+-- 
+2.47.3
+

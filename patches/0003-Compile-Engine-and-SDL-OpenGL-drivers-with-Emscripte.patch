@@ -1,0 +1,301 @@
+From a252f1d5ac4505270ce5f68a9c815539c9681b30 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 08:09:33 -0700
+Subject: [PATCH 03/16] Compile Engine and SDL OpenGL drivers with Emscripten
+
+---
+ CHANGES-wasm-port.md                 | 16 ++++++++++++++++
+ Engine/Inc/EngineClasses.h           |  4 ++++
+ Engine/Inc/UnCDKey.h                 |  4 ++++
+ Engine/Inc/UnNullRenderDevice.h      |  4 ++++
+ Engine/Inc/UnPackageCheckInfo.h      |  2 +-
+ Engine/Inc/UnPrim.h                  |  4 ++++
+ Engine/Inc/UnSkeletalMesh.h          |  4 ++++
+ Engine/Src/AxWeatherEffect.cpp       |  3 +++
+ Engine/Src/UnTerrain.cpp             |  3 +++
+ IpDrv/Src/TcpLink.cpp                |  4 ++++
+ IpDrv/Src/UnSocket.cpp               |  2 ++
+ OpenGLDrv/Inc/OpenGLDrv.h            |  5 ++++-
+ OpenGLDrv/Src/OpenGLRenderDevice.cpp | 24 ++++++++++++++++++++----
+ 13 files changed, 73 insertions(+), 6 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 3f4bc4a..1b0de31 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -19,3 +19,19 @@ Baseline: `ec2638b` already contains Emscripten platform types, C rotate/timer f
+ - `Core/Inc/UnGnuG.h`, `unixToANSI`: add Emscripten ANSI-build identity-copy overload (including existing null-to-empty behavior) and string declaration; Unix file manager previously exposed only Unicode conversion.
+ 
+ Core validation: all 20 objects rebuilt successfully. `llvm-nm --undefined-only --demangle` finds no unresolved `operator new` for `TArray<FString>`; full linking remains outside scope. ANSI-copy self-check passed normal, empty, null input and return-pointer cases.
++
++## Engine and drivers
++
++- `Engine/Inc/EngineClasses.h`, `AFileLog::Destroy`; `Engine/Inc/UnSkeletalMesh.h`, `USkeletalMesh::GetCollisionBoundingBox`: omit illegal in-class extra qualification for Emscripten.
++- `Engine/Inc/UnPackageCheckInfo.h`, `BF_WordByte`: select existing little-endian layout on Emscripten despite libc defining both endian constants.
++- `Engine/Inc/UnCDKey.h`, `ValidateCDKey`: format identical signed decimal seed using `FString::Printf` on Emscripten; unavailable wide conversion replaced without bypassing validation.
++- `IpDrv/Src/TcpLink.cpp`, text send: preserve constness of Emscripten ANSI string pointer; bytes only read.
++- `IpDrv/Src/UnSocket.cpp`, socket error text: omit colliding resolver-code cases on Emscripten, retaining errno meanings; diagnostic ambiguity remains for resolver codes.
++- `OpenGLDrv/Src/OpenGLRenderDevice.cpp`, platform selection/library name; `OpenGLDrv/Inc/OpenGLDrv.h`, includes: select existing SDL GL path and declare SDL APIs on Emscripten; built-in library uses empty name. GL compatibility remains link/runtime work.
++- `OpenGLDrv/Inc/OpenGLDrv.h`, Emscripten includes: use bundled SDL3 headers (matching SDLDrv), not SDK SDL1 stub headers.
++- `OpenGLDrv/Src/OpenGLRenderDevice.cpp`, `Init`, `Exec`, `Present`: Emscripten SDL3 equivalents use null built-in GL library and bool result, query fullscreen modes with matching dimensions/depth, and swap current GL window.
++- `OpenGLDrv/Src/OpenGLRenderDevice.cpp`, `UpdateGamma`, `RestoreGamma`: Emscripten-only omit unsupported hardware gamma API (SDL3/browser); shader gamma deferred to runtime phase, native paths unchanged.
++- `Engine/Src/AxWeatherEffect.cpp`, weather vertex stream `GetStreamData`: define scalar fallback when Emscripten has SSE disabled; use existing scalar algorithm unchanged.
++- `Engine/Inc/UnNullRenderDevice.h`, includes: resolve private Engine header relative to current header on Emscripten.
++- `Engine/Inc/UnPrim.h`, `CompareHits`: expose hidden friend at namespace scope on Emscripten so `MultiLineCheck` can pass existing comparator to qsort.
++- `Engine/Src/UnTerrain.cpp`, integer `Compare`: forward-declare before template definition on Emscripten; built-in `int` has no ADL, existing sort and comparator unchanged.
+diff --git a/Engine/Inc/EngineClasses.h b/Engine/Inc/EngineClasses.h
+index 907bdbc..f166731 100644
+--- a/Engine/Inc/EngineClasses.h
++++ b/Engine/Inc/EngineClasses.h
+@@ -3827,7 +3827,11 @@ public:
+     DECLARE_FUNCTION(execOpenLog);
+     DECLARE_CLASS(AFileLog,AInfo,0,Engine)
+ 	void FinishLog();
++#if defined(__EMSCRIPTEN__)
++	void Destroy();
++#else
+ 	void AFileLog::Destroy();
++#endif
+ };
+ 
+ struct ENGINE_API FHitFXData
+diff --git a/Engine/Inc/UnCDKey.h b/Engine/Inc/UnCDKey.h
+index 6d077ce..4928bf4 100644
+--- a/Engine/Inc/UnCDKey.h
++++ b/Engine/Inc/UnCDKey.h
+@@ -83,8 +83,12 @@ inline UBOOL ValidateCDKey( const TCHAR* CDKey, const TCHAR* AppendString=CDKEYA
+ 
+ 	QWORD Seed = appStrtoq( *CDKeyMapToHex(*Random), NULL, CDKEYBASE );
+ 	
++#if defined(__EMSCRIPTEN__)
++	FString Check = FString::Printf(TEXT("%lld"), (SQWORD)Seed);
++#else
+ 	TCHAR buf[128];
+ 	FString Check = _i64tow(*((SQWORD *) &Seed), buf, 10);
++#endif
+ 	Check += AppendString;
+ 
+ 	const ANSICHAR* AnsiCheck = appToAnsi(*Check);
+diff --git a/Engine/Inc/UnNullRenderDevice.h b/Engine/Inc/UnNullRenderDevice.h
+index 4b51f73..b55aacc 100644
+--- a/Engine/Inc/UnNullRenderDevice.h
++++ b/Engine/Inc/UnNullRenderDevice.h
+@@ -1,7 +1,11 @@
+ #ifndef UNullRenderDevice_H
+ #define UNullRenderDevice_H
+ 
++#if defined(__EMSCRIPTEN__)
++#include "../Src/EnginePrivate.h"
++#else
+ #include "EnginePrivate.h"
++#endif
+ 
+ #include "UnForcePacking_begin.h"
+ 
+diff --git a/Engine/Inc/UnPackageCheckInfo.h b/Engine/Inc/UnPackageCheckInfo.h
+index 1e0ffc3..e7c60c9 100644
+--- a/Engine/Inc/UnPackageCheckInfo.h
++++ b/Engine/Inc/UnPackageCheckInfo.h
+@@ -40,7 +40,7 @@ public:
+ #define LITTLE_ENDIAN
+ 
+ 
+-#ifdef BIG_ENDIAN
++#if defined(BIG_ENDIAN) && !defined(__EMSCRIPTEN__)
+ struct BF_WordByte
+ {
+ 	DWORD zero:8;
+diff --git a/Engine/Inc/UnPrim.h b/Engine/Inc/UnPrim.h
+index 2a65010..a7c0cdf 100644
+--- a/Engine/Inc/UnPrim.h
++++ b/Engine/Inc/UnPrim.h
+@@ -66,6 +66,10 @@ struct FCheckResult : public FIteratorActorList
+ //		{ return A->Time<B->Time ? -1 : A->Time>B->Time ? 1 : 0; }
+ };
+ 
++#if defined(__EMSCRIPTEN__)
++QSORT_RETURN CDECL CompareHits(const FCheckResult* A, const FCheckResult* B);
++#endif
++
+ /*-----------------------------------------------------------------------------
+ 	UPrimitive.
+ -----------------------------------------------------------------------------*/
+diff --git a/Engine/Inc/UnSkeletalMesh.h b/Engine/Inc/UnSkeletalMesh.h
+index 353e390..bbf3afb 100644
+--- a/Engine/Inc/UnSkeletalMesh.h
++++ b/Engine/Inc/UnSkeletalMesh.h
+@@ -1328,7 +1328,11 @@ class ENGINE_API USkeletalMesh : public ULodMesh
+    
+ 
+ 	virtual UBOOL LineCheck(FCheckResult &Result,AActor* Owner,const FVector& End,const FVector& Start,const FVector& Extent,DWORD ExtraNodeFlags, DWORD TraceFlags);
++#if defined(__EMSCRIPTEN__)
++	virtual FBox GetCollisionBoundingBox( const AActor* Owner ) const;
++#else
+ 	virtual FBox USkeletalMesh::GetCollisionBoundingBox( const AActor* Owner ) const;
++#endif
+ 	virtual UBOOL UseCylinderCollision( const AActor* Owner );	
+ 	virtual UBOOL PointCheck(FCheckResult&	Result, AActor*	Owner, const FVector& Location, const FVector& Extent, DWORD ExtraNodeFlags);
+ 
+diff --git a/Engine/Src/AxWeatherEffect.cpp b/Engine/Src/AxWeatherEffect.cpp
+index cec1625..2977007 100644
+--- a/Engine/Src/AxWeatherEffect.cpp
++++ b/Engine/Src/AxWeatherEffect.cpp
+@@ -463,6 +463,9 @@ public:
+ 		#endif
+ #endif
+ 
++#if defined(__EMSCRIPTEN__) && !USE_SSE_WEATHER
++		const UBOOL UseScalarFallback = 1;
++#endif
+ 		if (UseScalarFallback)
+ 		{
+ 			int numPcl = pFx->pcl.Num();
+diff --git a/Engine/Src/UnTerrain.cpp b/Engine/Src/UnTerrain.cpp
+index 8c64706..2e8f489 100644
+--- a/Engine/Src/UnTerrain.cpp
++++ b/Engine/Src/UnTerrain.cpp
+@@ -6,6 +6,9 @@
+ 		* Created by Jack Porter
+ =============================================================================*/
+ 
++#if defined(__EMSCRIPTEN__)
++static inline int Compare(int& A, int& B); // Visible before Sort<int> is defined.
++#endif
+ #include "EnginePrivate.h"
+ #include <math.h>
+ 
+diff --git a/IpDrv/Src/TcpLink.cpp b/IpDrv/Src/TcpLink.cpp
+index ffb9254..648ca6b 100644
+--- a/IpDrv/Src/TcpLink.cpp
++++ b/IpDrv/Src/TcpLink.cpp
+@@ -716,7 +716,11 @@ void ATcpLink::execSendText( FFrame& Stack, RESULT_DECL )
+ 				case LMODE_MAC:		Str += TEXT("\n\r"); break;
+ 			}
+ 		}
++#if defined(__EMSCRIPTEN__)
++		const ANSICHAR* p = TCHAR_TO_ANSI(*Str);
++#else
+ 		ANSICHAR* p = TCHAR_TO_ANSI(*Str);
++#endif
+ 		INT Count = (INT) ::strlen(p);
+ 		INT Index = SendFIFO.Add( Count );
+ 		appMemcpy( &SendFIFO(Index), p, Count );
+diff --git a/IpDrv/Src/UnSocket.cpp b/IpDrv/Src/UnSocket.cpp
+index 7ce63ec..e6e5106 100644
+--- a/IpDrv/Src/UnSocket.cpp
++++ b/IpDrv/Src/UnSocket.cpp
+@@ -277,8 +277,10 @@ TCHAR* SocketError( INT Code )
+ 		case ESTALE:				return TEXT("ESTALE");
+ 		case EREMOTE:				return TEXT("EREMOTE");
+ 		case HOST_NOT_FOUND:		return TEXT("HOST_NOT_FOUND");
++#if !defined(__EMSCRIPTEN__) // Resolver codes overlap WASI errno values.
+ 		case TRY_AGAIN:				return TEXT("TRY_AGAIN");
+ 		case NO_RECOVERY:			return TEXT("NO_RECOVERY");
++#endif
+ 		case 0:						return TEXT("NO_ERROR");
+ 		default:					return TEXT("Unknown");
+ 	}
+diff --git a/OpenGLDrv/Inc/OpenGLDrv.h b/OpenGLDrv/Inc/OpenGLDrv.h
+index 56e3a19..e50f01e 100644
+--- a/OpenGLDrv/Inc/OpenGLDrv.h
++++ b/OpenGLDrv/Inc/OpenGLDrv.h
+@@ -19,7 +19,7 @@
+ #include <windows.h>
+ #pragma pack(pop)
+ #else
+-#include "SDL.h"
++#include <SDL3/SDL.h>
+ #endif
+ 
+ #include "GL/gl.h"
+@@ -38,6 +38,9 @@
+ #define GL_VERTEX_ARRAY_BINDING_APPLE		0x85B5
+ */
+ 
++#if defined(__EMSCRIPTEN__)
++#include <SDL3/SDL.h>
++#endif
+ #include <SDL3/SDL_opengl.h>
+ 
+ #include "Engine.h"
+diff --git a/OpenGLDrv/Src/OpenGLRenderDevice.cpp b/OpenGLDrv/Src/OpenGLRenderDevice.cpp
+index 8223db5..147acfb 100644
+--- a/OpenGLDrv/Src/OpenGLRenderDevice.cpp
++++ b/OpenGLDrv/Src/OpenGLRenderDevice.cpp
+@@ -14,7 +14,7 @@
+ -----------------------------------------------------------------------------*/
+ 
+ // !!! FIXME: This should get rid of all these win32 vs. SDL ifdefs. --ryan.
+-#if ((__linux__) || (__FreeBSD__) || (MACOSX))
++#if ((__linux__) || (__FreeBSD__) || (MACOSX) || defined(__EMSCRIPTEN__))
+ #  define USE_SDL 1
+ #endif
+ 
+@@ -22,6 +22,8 @@
+ #   define GL_DLL (TEXT("OpenGL32.dll"))
+ #elif ((__linux__) || (__FreeBSD__))
+ #   define GL_DLL (TEXT("libGL.so.1"))
++#elif defined(__EMSCRIPTEN__)
++#   define GL_DLL (TEXT("")) // SDL uses the built-in GL implementation.
+ #elif MACOSX
+ #   define GL_DLL (TEXT("libGL.dylib"))   // !!! FIXME: probably wrong.
+ #else
+@@ -333,7 +335,11 @@ UBOOL UOpenGLRenderDevice::Init()
+ 		{
+ 			// Only call it once as succeeding calls will 'fail'.
+ 			debugf( TEXT("binding %s"), *OpenGLLibName );
++#if defined(__EMSCRIPTEN__)
++			if ( !SDL_GL_LoadLibrary( NULL ) )
++#else
+ 			if ( SDL_GL_LoadLibrary( appToAnsi(*OpenGLLibName) ) == -1 )
++#endif
+ 				appErrorf( appFromAnsi(SDL_GetError()) );
+ 			GLLoaded = true;
+ 		}
+@@ -1156,7 +1162,9 @@ void UOpenGLRenderDevice::UpdateGamma(UViewport* Viewport)
+ 	for(INT i=0; i<256; i++)
+ 		Ramp.red[i] = Ramp.green[i] = Ramp.blue[i] = Clamp<INT>( appRound( (Contrast+0.5f)*appPow(i/255.f,1.0f/Gamma)*65535.f + (Brightness-0.5f)*32768.f - Contrast*32768.f + 16384.f ), 0, 65535 );
+ 
+-#if (defined USE_SDL)
++#if defined(__EMSCRIPTEN__)
++	// Browser/SDL3 has no hardware gamma ramp; shader gamma is runtime work.
++#elif (defined USE_SDL)
+ 	SDL_SetGammaRamp( Ramp.red, Ramp.green, Ramp.blue );
+ #elif (defined WIN32)
+ 	SetDeviceGammaRamp( hDC, &Ramp );
+@@ -1188,7 +1196,9 @@ void UOpenGLRenderDevice::RestoreGamma()
+ 	for(INT i=0; i<256; i++)
+ 		Ramp.red[i] = Ramp.green[i] = Ramp.blue[i] = i << 8;
+ 
+-#if (defined USE_SDL)
++#if defined(__EMSCRIPTEN__)
++	// Browser/SDL3 has no hardware gamma ramp; shader gamma is runtime work.
++#elif (defined USE_SDL)
+ 	SDL_SetGammaRamp( Ramp.red, Ramp.green, Ramp.blue );
+ #elif (defined WIN32)
+ //	SetDeviceGammaRamp( hDC, &Ramp );
+@@ -1312,6 +1322,10 @@ UBOOL UOpenGLRenderDevice::Exec(const TCHAR* Cmd,FOutputDevice& Ar)
+ 				}
+ 			}
+ 
++#elif defined(__EMSCRIPTEN__)
++			SDL_DisplayMode Mode;
++			Supported = SDL_GetClosestFullscreenDisplayMode(SDL_GetPrimaryDisplay(), Width, Height, 0, false, &Mode)
++				&& Mode.w == Width && Mode.h == Height && SDL_BITSPERPIXEL(Mode.format) == BitDepth;
+ #elif USE_SDL
+ 			int ok = SDL_VideoModeOK(Width, Height, BitDepth, SDL_OPENGL | SDL_FULLSCREEN);
+ 			if (ok == BitDepth)
+@@ -1464,7 +1478,9 @@ void UOpenGLRenderDevice::Present(UViewport* Viewport)
+ 		glFinish();
+ #endif
+ 
+-#if (defined USE_SDL)
++#if defined(__EMSCRIPTEN__)
++	SDL_GL_SwapWindow( SDL_GL_GetCurrentWindow() );
++#elif (defined USE_SDL)
+ 	SDL_GL_SwapBuffers();
+ #elif (defined WIN32)
+ 	verify( SwapBuffers( hDC ) );
+-- 
+2.47.3
+

@@ -1,0 +1,59 @@
+From b5629e960c67546ca9ac457f8b15dd0a6d193aa5 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 15:52:01 -0700
+Subject: [PATCH 14/16] Preserve wasm framebuffer resolution during browser
+ layout changes
+
+---
+ CHANGES-wasm-port.md       | 20 ++++++++++++++++++++
+ SDLDrv/Src/SDLViewport.cpp |  5 +++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 3d30efe..ba46700 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -285,3 +285,23 @@ exit=1
+   input checks. Both scoreboards show WasmOne and WasmTwo, with server-side player
+   records and clean browser exits. The isolated 3369 server/relay were removed
+   and the prior Caddy configuration restored after evidence capture.
++
++## Phase 7 — browser transport and display shell
++
++- Wrapper `web/http-library.js` now streams a whole package on first access,
++  coalesces reads into a 160 MiB LRU, and validates direct-range fallbacks.
++  `web/pre.js` keeps the existing filesystem/syscall integration. No engine
++  load-plan, command-line, or native behavior changed.
++- `SDLViewport.cpp` omits `SDL_WINDOW_RESIZABLE` only under `__EMSCRIPTEN__`,
++  preventing browser resize/fullscreen events from changing internal resolution.
++- Browser shell sets 1280x720 by default, persists a resolution selector, accepts
++  validated `res=WxH`, and updates browser-only INI viewport defaults before init.
++  Fullscreen uses a wrapper and CSS scaling, with a gesture fallback for URL requests.
++- Lab Caddy configuration scopes wasm MIME/compression and week-long data/wasm
++  caching to `/ut2004/`; UT99 retains raw octet-stream wasm. HTML/JS revalidate.
++- Reproducible tests and live pve/mesa cold/warm evidence: wrapper `build/phase7/`.
++- SDL keyboard targeting is set before runtime initialization so native shell
++  controls retain arrow-key behavior outside the focused canvas.
++- Performance target failed: final pve cold first frame 106.0 s versus 52.1 s
++  baseline; full-file prefetch increased startup traffic to 2.07 GB. See wrapper
++  `docs/phase7-report.md` for measurements and current multiplayer map limitations.
+diff --git a/SDLDrv/Src/SDLViewport.cpp b/SDLDrv/Src/SDLViewport.cpp
+index 3ca3de1..c270fda 100644
+--- a/SDLDrv/Src/SDLViewport.cpp
++++ b/SDLDrv/Src/SDLViewport.cpp
+@@ -545,7 +545,12 @@ void USDLViewport::OpenWindow( PTRINT InParentWindow, UBOOL IsTemporary, INT New
+     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+     SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
+ #endif
++#if defined(__EMSCRIPTEN__)
++    // Browser fullscreen/responsive layout scales CSS without resizing the framebuffer.
++    Window = SDL_CreateWindow("NULL", 640, 480, SDL_WINDOW_OPENGL);
++#else
+ 	Window = SDL_CreateWindow("NULL", 640, 480, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
++#endif
+ 	Context = SDL_GL_CreateContext(Window);
+ #if !defined(__EMSCRIPTEN__)
+ 	ScreenSurface = SDL_GetWindowSurface(Window); // This function must be called every time window resised
+-- 
+2.47.3
+

@@ -1,0 +1,29 @@
+/* Scoped play-area controls. DOM forms and page scrolling outside this host stay native. */
+.mobile-input-host { position:relative; touch-action:none; overscroll-behavior:contain; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none }
+.mobile-input, .mobile-input * { box-sizing:border-box; touch-action:none }
+.mobile-input[hidden], .mobile-input [hidden], .mobile-input-toast[hidden] { display:none !important }
+.mobile-input { position:absolute; inset:0; z-index:5; pointer-events:none; font:12px system-ui; line-height:1.2; padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left) }
+.mobile-input-look { position:absolute; inset:0 0 0 40%; pointer-events:auto }
+.mobile-input-stick { position:absolute; width:110px; height:110px; left:max(16px,env(safe-area-inset-left)); bottom:max(20px,env(safe-area-inset-bottom)); border:2px solid #fff9; border-radius:50%; background:#15202a55; pointer-events:auto }
+.mobile-input-stick span { position:absolute; width:44px; height:44px; left:31px; top:31px; border-radius:50%; background:#cbe6ff99; transform:translate(var(--stick-x,0px),var(--stick-y,0px)) }
+.mobile-input button { position:absolute; pointer-events:auto; color:white; background:#132739cc; border:1px solid #e1f3ffaa; border-radius:18px; min-height:40px; padding:6px 9px; font:inherit; text-shadow:0 1px #000 }
+.mobile-input button:active { background:#527ba7ee }
+.mobile-input-toggle { top:max(8px,env(safe-area-inset-top)); left:max(8px,env(safe-area-inset-left)) }
+.mobile-input-button[data-id=escape] { top:max(8px,env(safe-area-inset-top)); right:max(8px,env(safe-area-inset-right)) }
+.mobile-input-button[data-id=score] { top:max(8px,env(safe-area-inset-top)); right:64px }
+.mobile-input-button[data-id=fire] { right:max(12px,env(safe-area-inset-right)); bottom:70px; width:var(--button-size,64px); height:var(--button-size,64px); border-radius:50% }
+.mobile-input-button[data-id=alt] { right:84px; bottom:76px }
+.mobile-input-button[data-id=jump] { right:12px; bottom:max(20px,env(safe-area-inset-bottom)) }
+.mobile-input-button[data-id=crouch] { right:84px; bottom:max(20px,env(safe-area-inset-bottom)) }
+.mobile-input-button[data-id=use] { right:12px; bottom:144px }
+.mobile-input-button[data-id=next] { right:72px; bottom:144px }
+.mobile-input-button[data-id=prev] { right:132px; bottom:144px }
+.mobile-input-cursor { position:absolute; transform:translate(-50%,-50%); color:#fff; text-shadow:1px 1px #000; font:bold 28px monospace; pointer-events:none }
+.mobile-input-menu .mobile-input-look { inset:0 }
+.mobile-input-menu .mobile-input-stick, .mobile-input-menu .mobile-input-button:not([data-id=escape]) { display:none }
+.mobile-input-toast { position:absolute; left:50%; top:56px; transform:translateX(-50%); z-index:6; padding:8px; max-width:90%; background:#102536ee; color:white; font:14px system-ui; line-height:1.3; pointer-events:none }
+@media (orientation:portrait) { .mobile-input-host { min-height:360px; display:flex; align-items:center; background:#000 } }
+@media (orientation:landscape) and (max-height:600px) {
+  .mobile-input-host { height:100svh; min-height:0; display:flex; align-items:center; justify-content:center }
+  .mobile-input-host canvas { width:min(100%, calc(100svh * var(--aspect))); max-height:100svh }
+}

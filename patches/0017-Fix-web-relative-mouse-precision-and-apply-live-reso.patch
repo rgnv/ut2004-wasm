@@ -1,0 +1,247 @@
+From 3c00eecee156a80433404fcc0ed75c0d49d754b6 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 22:30:39 -0700
+Subject: [PATCH 17/21] Fix web relative mouse precision and apply live
+ resolution between ticks
+
+---
+ CHANGES-wasm-port.md                          | 32 ++++++++++++++++++
+ Launch/Src/LaunchEmscripten.cpp               | 17 ++++++++++
+ OpenGLDrv/Src/OpenGLRenderDevice.cpp          |  7 ++++
+ .../video/emscripten/SDL_emscriptenevents.c   | 11 ++++---
+ .../video/emscripten/SDL_emscriptenmouse.c    | 33 ++++++++++++-------
+ .../video/emscripten/SDL_emscriptenmouse.h    |  1 +
+ SDLDrv/Src/SDLViewport.cpp                    | 11 +++++++
+ 7 files changed, 95 insertions(+), 17 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index e480833..1682e84 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -343,3 +343,35 @@ exit=1
+   it with `memory access out of bounds`. Native recursion stays unchanged.
+ - Browser shell, automated map/admin/travel checks and source/server evidence
+   are maintained in the wrapper repository under `build/phase8/`.
++
++## Phase 9 — raw relative mouse and live resolution
++
++- SDL Emscripten mouse/pen relative paths forward browser movementX/Y unchanged;
++  absolute coordinates retain canvas scaling. Both initial lock and click regrab
++  use one explicit `requestPointerLock({unadjustedMovement: true})` helper with
++  logged adjusted-input fallback. The html5.h request's boolean was a gesture
++  deferral flag, not raw input. Web viewport now enables SDL relative mode.
++- `SDLViewport.cpp` reports float deltas at the existing IK_MouseX/IK_MouseY
++  dispatch only when `Module.debugInput` is enabled (`?debug=1` in the wrapper).
++  MouseY retains the existing negative sign; SDL drains all queued events.
++- Web launcher exposes validated `ut2004_request_resolution` with an atomic packed
++  pending request. Between RAF waits and ticks it dispatches the existing SETRES
++  viewport command and acknowledges effective dimensions to the shell. Native,
++  Node, bounded and splash loops retain their prior behavior.
++- `OpenGLRenderDevice.cpp::SetRes` retains the existing WebGL context and GPU
++  resources for windowed dimension-only changes. The ordinary ResizeViewport
++  path updates SDL/framebuffer size; the next Lock updates viewport/scissor.
++  Full resource flush/scene precache caused a measured 1,938 ms dynamic resize.
++- Wrapper shell adds live custom/preset/dynamic resolution, even snapping and
++  bounds, persisted selection, debounced viewport/DPR updates, and explicit plus
++  automatic reload fallback. Dynamic axes clamp independently to 2560x1440.
++- Reproducible pve-only Chrome acceptance harness and evidence: wrapper
++  `scripts/test-phase9.cjs`, `build/phase9/`. Final measurements are recorded in
++  the wrapper's `docs/phase9-report.md`.
++- Final pve Chrome acceptance: X totals 400 at 1.0/0.55 CSS scale, after regrab,
++  at DPR 2 and fullscreen; Y total -240. Custom 1024x600 and preset 640x480
++  render live; dynamic 1600x900 applies in 665 ms and DPR-2 portrait clamps to
++  1800x1440 in 641 ms. Explicit/automatic reload, bounded/splash and clean exits
++  pass; no page/GL/WebGL errors. Headless pve rejects unadjustedMovement with
++  NotSupportedError, exercising the logged fallback; hardware raw input is not
++  claimed. Full evidence and failed iteration history remain in `build/phase9/`.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index c1739e5..2c7bcf6 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -12,6 +12,14 @@
+ 
+ #if defined(UT2004_WEB_CLIENT)
+ extern "C" void RegisterNamesXInterface(void);
++// One atomic mailbox: JS can queue during Asyncify waits, never mutate a viewport.
++static unsigned PendingResolution;
++extern "C" EMSCRIPTEN_KEEPALIVE int ut2004_request_resolution(int w, int h)
++{
++    if (w < 320 || w > 3840 || h < 240 || h > 2160 || (w & 1) || (h & 1)) return 0;
++    __atomic_store_n(&PendingResolution, ((unsigned)w << 16) | h, __ATOMIC_RELEASE);
++    return 1;
++}
+ // Keep async package reads on one suspended main stack; never overlap engine ticks.
+ EM_ASYNC_JS(void, WaitForBrowserFrame, (), {
+     await new Promise(requestAnimationFrame);
+@@ -156,6 +164,15 @@ int main(int argc, char** argv)
+                 WaitForBrowserFrame();
+                 if (EM_ASM_INT({ return Module.shutdownRequested ? 1 : 0; })) break;
+             }
++            const unsigned Resolution = __atomic_exchange_n(&PendingResolution, 0, __ATOMIC_ACQUIRE);
++            if (Resolution && Interactive && !Splash && Engine->Client && Engine->Client->Viewports.Num())
++            {
++                const INT W = Resolution >> 16, H = Resolution & 65535;
++                UViewport* Viewport = Engine->Client->Viewports(0);
++                Viewport->Exec(*FString::Printf(TEXT("SETRES %ix%ix32w"), W, H), *GLog);
++                EM_ASM({ if (Module.resolutionApplied) Module.resolutionApplied($0, $1, !!$2); },
++                    W, H, Viewport->SizeX == W && Viewport->SizeY == H);
++            }
+             const DOUBLE Now = appSeconds();
+             Engine->Tick(Interactive ? Clamp<FLOAT>(Now - Previous, 0.001f, 0.1f) : 1.0f / 60.0f);
+             Previous = Now;
+diff --git a/OpenGLDrv/Src/OpenGLRenderDevice.cpp b/OpenGLDrv/Src/OpenGLRenderDevice.cpp
+index 6caba27..4827457 100644
+--- a/OpenGLDrv/Src/OpenGLRenderDevice.cpp
++++ b/OpenGLDrv/Src/OpenGLRenderDevice.cpp
+@@ -430,6 +430,13 @@ UBOOL UOpenGLRenderDevice::SetRes(UViewport* Viewport,INT NewX,INT NewY,UBOOL Fu
+ 
+ 	debugf(TEXT("Enter SetRes: %dx%d Fullscreen %d"), NewX, NewY, Fullscreen );
+ 
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++    // WebGL canvas resizing retains context/resources; flushing forces a full scene precache.
++    if (ValidContext && !Fullscreen && !WasFullscreen &&
++        (!ColorBytes || ColorBytes == (Use16bit ? 2 : 4)))
++        return Viewport->ResizeViewport(BLIT_OpenGL, NewX, NewY, bSaveSize);
++#endif
++
+ 	switch( ColorBytes )
+ 	{
+ 	case 0:
+diff --git a/SDL/src/video/emscripten/SDL_emscriptenevents.c b/SDL/src/video/emscripten/SDL_emscriptenevents.c
+index d0ec8aa..7ebfd24 100644
+--- a/SDL/src/video/emscripten/SDL_emscriptenevents.c
++++ b/SDL/src/video/emscripten/SDL_emscriptenevents.c
+@@ -32,6 +32,7 @@
+ #include "../../events/SDL_touch_c.h"
+ 
+ #include "SDL_emscriptenevents.h"
++#include "SDL_emscriptenmouse.h"
+ #include "SDL_emscriptenvideo.h"
+ 
+ /*
+@@ -650,7 +651,7 @@ static void Emscripten_HandleMouseButton(SDL_WindowData *window_data, const Emsc
+ 
+         if (down) {
+             if (mouse->relative_mode && !window_data->has_pointer_lock) {
+-                emscripten_request_pointerlock(window_data->canvas_id, 0); // try to regrab lost pointer lock.
++                Emscripten_RequestRawPointerLock(); // Regrab uses the same raw request as initial lock.
+             }
+         }
+ 
+@@ -687,8 +688,8 @@ static void Emscripten_UpdateMouseFromEvent(SDL_WindowData *window_data, const E
+     const bool isPointerLocked = window_data->has_pointer_lock;
+     float mx, my;
+     if (isPointerLocked) {
+-        mx = (float)(event->movementX * xscale);
+-        my = (float)(event->movementY * yscale);
++        mx = event->movementX;
++        my = event->movementY;
+     } else {
+         mx = (float)(event->targetX * xscale);
+         my = (float)(event->targetY * yscale);
+@@ -754,8 +755,8 @@ static void Emscripten_UpdatePenFromEvent(SDL_WindowData *window_data, const Ems
+         const bool isPointerLocked = window_data->has_pointer_lock;
+         float mx, my;
+         if (isPointerLocked) {
+-            mx = (float)(event->movementX * xscale);
+-            my = (float)(event->movementY * yscale);
++            mx = event->movementX;
++            my = event->movementY;
+         } else {
+             mx = (float)(event->targetX * xscale);
+             my = (float)(event->targetY * yscale);
+diff --git a/SDL/src/video/emscripten/SDL_emscriptenmouse.c b/SDL/src/video/emscripten/SDL_emscriptenmouse.c
+index ecf9daa..99d0a2b 100644
+--- a/SDL/src/video/emscripten/SDL_emscriptenmouse.c
++++ b/SDL/src/video/emscripten/SDL_emscriptenmouse.c
+@@ -171,21 +171,30 @@ static bool Emscripten_ShowCursor(SDL_Cursor *cursor)
+     return true;
+ }
+ 
++// Altered for the web port: the html5.h boolean is deferUntilInEventHandler, not raw input.
++EM_JS(int, Emscripten_RequestRawPointerLock, (void), {
++    const canvas = Module.canvas;
++    if (document.pointerLockElement === canvas) return 1;
++    const fallback = error => {
++        console.warn('SDL: raw pointer lock rejected: ' + error + '; falling back to adjusted movement');
++        try {
++            const request = canvas.requestPointerLock();
++            if (request) request.catch(error => console.warn('SDL: pointer lock failed: ' + error));
++        } catch (error) { console.warn('SDL: pointer lock failed: ' + error); }
++    };
++    console.log('SDL: pointer lock request unadjustedMovement=true (initial/regrab)');
++    try {
++        const request = canvas.requestPointerLock({unadjustedMovement: true});
++        if (request) request.catch(fallback);
++        return 1;
++    } catch (error) { fallback(error); return 1; }
++});
++
+ static bool Emscripten_SetRelativeMouseMode(bool enabled)
+ {
+-    SDL_Window *window;
+-    SDL_WindowData *window_data;
+-
+-    // TODO: pointer lock isn't actually enabled yet
++    // A startup request can await a user gesture; the button handler retries it.
+     if (enabled) {
+-        window = SDL_GetMouseFocus();
+-        if (!window) {
+-            return false;
+-        }
+-
+-        window_data = window->internal;
+-
+-        if (emscripten_request_pointerlock(window_data->canvas_id, 1) >= EMSCRIPTEN_RESULT_SUCCESS) {
++        if (Emscripten_RequestRawPointerLock()) {
+             return true;
+         }
+     } else {
+diff --git a/SDL/src/video/emscripten/SDL_emscriptenmouse.h b/SDL/src/video/emscripten/SDL_emscriptenmouse.h
+index 5fcfeb5..2a37085 100644
+--- a/SDL/src/video/emscripten/SDL_emscriptenmouse.h
++++ b/SDL/src/video/emscripten/SDL_emscriptenmouse.h
+@@ -28,6 +28,7 @@ struct SDL_CursorData
+     bool is_custom;
+ };
+ 
++extern int Emscripten_RequestRawPointerLock(void);
+ extern void Emscripten_InitMouse(void);
+ extern void Emscripten_QuitMouse(void);
+ 
+diff --git a/SDLDrv/Src/SDLViewport.cpp b/SDLDrv/Src/SDLViewport.cpp
+index c270fda..f5e19ee 100644
+--- a/SDLDrv/Src/SDLViewport.cpp
++++ b/SDLDrv/Src/SDLViewport.cpp
+@@ -17,6 +17,7 @@ Revision history:
+ 
+ #include "SDLDrv.h"
+ #if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
+ extern "C" void initialize_gl4es(void);
+ #endif
+ 
+@@ -560,6 +561,7 @@ void USDLViewport::OpenWindow( PTRINT InParentWindow, UBOOL IsTemporary, INT New
+     if (!Window || !Context || !SDL_GL_MakeCurrent(Window, Context))
+         appErrorf(TEXT("WASM: SDL GL context failed: %s"), appFromAnsi(SDL_GetError()));
+     initialize_gl4es();
++    SDL_SetWindowRelativeMouseMode(Window, true);
+     debugf(TEXT("WASM: SDL3 viewport and GL4ES context active"));
+ #endif
+ 
+@@ -1085,6 +1087,15 @@ void USDLViewport::UpdateInput( UBOOL Reset, FLOAT DeltaSeconds )
+ 			//DY += Event.motion.yrel;
+ 			CauseInputEvent(IK_MouseX, IST_Axis, Event.motion.xrel);
+ 			CauseInputEvent(IK_MouseY, IST_Axis, -Event.motion.yrel);
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++            EM_ASM({
++                if (Module.debugInput) {
++                    const d = Module.inputDebug || (Module.inputDebug = {mouseX: 0, mouseY: 0, events: 0});
++                    d.mouseX += $0; d.mouseY += $1; ++d.events;
++                    d.frames = Module.frameCount;
++                }
++            }, Event.motion.xrel, -Event.motion.yrel);
++#endif
+ 			break;
+ 
+ 		default:

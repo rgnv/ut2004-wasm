@@ -1,0 +1,8 @@
+{
+  "name": "ut2004-wasm-headless",
+  "private": true,
+  "description": "Node runtime dependency for the Emscripten SOCKFS shim",
+  "dependencies": {
+    "ws": "8.22.0"
+  }
+}

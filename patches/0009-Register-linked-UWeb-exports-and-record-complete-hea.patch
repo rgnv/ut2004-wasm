@@ -1,0 +1,47 @@
+From e10e60e63380fccc8a0890332b656961c584c35e Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 09:25:33 -0700
+Subject: [PATCH 09/16] Register linked UWeb exports and record complete
+ headless boot
+
+---
+ CHANGES-wasm-port.md        | 12 ++++++++++++
+ Launch/Src/wasm-registry.py |  2 +-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 91f72d9..221bf17 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -139,3 +139,15 @@ exit=1
+ - Differential regression: recursive archive with Node --stack-size=4096 and worklist archive with default Node stack yield byte-identical pre-purge dumps of 50,971 entries: 20,779 reachable objects, 168 unreachable objects, 29,889 reachable names, 135 unreachable names. Both proceed to the same socket fatal. Captures: `phase2c-recursive-reachability.txt`, `phase2c-worklist-reachability.txt`, `phase2c-gc-comparison.txt`, plus boot logs; temporary audit removed.
+ - Saved 2000-frame path contains 1955 Next edges, 17 Children, 10 SuperField, one Class, and 16 other references. Example valid crossings: Actor.MessageClass → LocalMessage; GameInfo.VehicleList → Vehicle → Pawn; Pawn.LastHitBy → Controller; LevelInfo.ReplicationViewer → PlayerController. Object/class property serializers and script references connect the independently valid sibling lists. Loader ULinkerLoad::operator<< resolves stored package indices via IndexToObject; UField/UStruct deserialize Next/Children directly. No loader correction is justified.
+ - `IpDrv/Src/TcpNetDriver.cpp`, UTcpNetDriver::InitBase (shared by InitConnect/InitListen): Emscripten-only SO_BROADCAST failure now warns and continues without setting Error; native fatal behavior unchanged. Uses `%s` for SocketError(), which returns TCHAR*: the previous displayed numbers (68850/68888) were string addresses, not errno values. No UDP/broadcast functionality is claimed.
++- Next full boot (`phase2c-socket-fixed.log`) passes active GC, purges 168 objects, warns ENOPROTOOPT, then the generated Node SOCKFS bind path fails `Cannot find module 'ws'`. Parent package.json/package-lock.json now pin ws 8.22.0 (same version already installed in the local relay workspace); install with `npm ci --ignore-scripts`. Real Emscripten socket behavior retained.
++- With ws installed, boot next fails `Can't bind to native class UWeb.WebRequest` (`phase2c-ws-installed.log`). Stock config names UWeb.WebServer as a ServerActor and UWeb as a ServerPackage even though bEnabled=False. Parent link-em.sh now compiles the three existing UWeb sources; wasm-registry.py includes their real exports in the guarded static registry. No server-actor bypass or fake native functions. Header freshness tracking includes UWeb.
++- Parent link recipe restores 8 MiB linear-memory stack after measuring the separate V8 stack failure; retains incoming exception compile/link flags. Final build recompiles all objects because recipe/header settings changed.
++- Parent workspace bookkeeping: ignore local game data, independent source checkouts, generated build outputs and node_modules; explicitly retain phase2c evidence with git add -f. Preserve previously untracked briefs, compile harness, and prior phase reports unchanged in parent history so both requested worktrees can be clean. STATUS.md and docs/phase2c-report.md record this phase and reproducible commands; neither game data nor the separate UT2004Patches checkout is modified.
++
++### Phase 2c final acceptance
++
++- Full rebuild compiled 166 objects and linked successfully (`build/logs/phase2c-full-compile.log`, `phase2c-link-uweb.log`). UWeb required no C++ source changes. Link stack is 8 MiB; Node uses its default host stack.
++- `npm ci --ignore-scripts --no-audit --no-fund` succeeds from the committed lockfile (`phase2c-npm-ci.log`). `python3 build/phase2c-validate.py` runs the full boot with WASM_SKIP_GC and NODE_OPTIONS unset, mounts package tables, checks usage rejection, compares historical GC marks, checks wasm headers, and checks five package/config hashes. All assertions pass (`build/phase2c-validation.txt`). The validation harness is an evidence artifact in the parent repository.
++- Final command: `env -u WASM_SKIP_GC UT2004_BASE="$PWD/data3369/UT2004/System" node build/ut2004.js`. Transcript `build/logs/phase2c-final.log` records GC `21115->20947`, `Bringing Level NvidiaLogo.myLevel up for play`, `WASM: engine initialized`, `WASM: bounded loop complete`, `WASM: clean exit`, exit 0. Initial successful UWeb run is `phase2c-uweb-linked.log`. UWeb registration accounts for the changed object totals compared with the earlier differential test.
++- Mount mode exits 0; invalid CLI option exits 2; full boot exits 0. Core.u, Engine.u, Ipdrv.u, UT2004.ini and User.ini hashes unchanged from the pre-fix snapshot. Both git diff --check checks pass. All temporary GC audit instrumentation removed; env-gated skip retained, unused in acceptance.
++- Known nonfatal messages: absent Editor.TransBuffer in this headless build; unsupported SO_REUSEADDR. No browser/rendering, actual multiplayer traffic, native build/run, or arbitrary-map validation claimed. The synchronous three-tick Node probe is not a networking acceptance test.
+diff --git a/Launch/Src/wasm-registry.py b/Launch/Src/wasm-registry.py
+index 73c5915..21251c6 100644
+--- a/Launch/Src/wasm-registry.py
++++ b/Launch/Src/wasm-registry.py
+@@ -7,7 +7,7 @@ import sys
+ out = ['#if defined(__EMSCRIPTEN__)', '#include "Core.h"',
+        'struct FWasmExport { const char* Name; void* Address; };']
+ modules = []
+-for module in ("Core", "Engine", "IpDrv"):
++for module in ("Core", "Engine", "IpDrv", "UWeb"):
+     objects = sorted(pathlib.Path(sys.argv[1], module.lower()).glob("*.o"))
+     assert objects, module
+     symbols = subprocess.check_output(
+-- 
+2.47.3
+

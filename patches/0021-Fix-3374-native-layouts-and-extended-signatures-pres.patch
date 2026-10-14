@@ -1,0 +1,1294 @@
+From a63a4ad0e868dc217e241b932ee26dd7890ca5fd Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Wed, 14 Oct 2026 04:49:03 -0700
+Subject: [PATCH 21/21] Fix 3374 native layouts and extended signatures;
+ preserve 3369 boot
+
+---
+ .../Engine/Classes/Actor.uc                   |   8 +-
+ CHANGES-wasm-port.md                          |  82 +++++++----
+ Core/Inc/UnClass.h                            |  22 +++
+ Core/Src/UnClass.cpp                          |  97 +++++++++++--
+ Engine/Inc/EngineClasses.h                    |  34 ++++-
+ Engine/Inc/UnAudio.h                          |   5 +-
+ Engine/Inc/UnCamera.h                         |   5 +
+ Engine/Src/UnAudio.cpp                        |  72 ++++++++-
+ Engine/Src/UnCamMgr.cpp                       |   5 +
+ Engine/Src/UnGame.cpp                         | 137 ++++++++++++++++++
+ Engine/Src/UnScript.cpp                       |  99 +++++++++++--
+ IpDrv/Inc/IpDrvClasses.h                      |   9 ++
+ IpDrv/Src/IpDrv.cpp                           |  59 ++++++++
+ Launch/Src/LaunchEmscripten.cpp               |   9 ++
+ XInterface/Inc/XInterfaceClasses.h            |  12 ++
+ XInterface/Src/UnGUICore.cpp                  |   1 +
+ XInterface/Src/XInterface.cpp                 |  92 ++++++++++++
+ 17 files changed, 687 insertions(+), 61 deletions(-)
+
+diff --git a/!_UnrealScript_And_Stuff/Engine/Classes/Actor.uc b/!_UnrealScript_And_Stuff/Engine/Classes/Actor.uc
+index 6b13f3c..be6df9d 100644
+--- a/!_UnrealScript_And_Stuff/Engine/Classes/Actor.uc
++++ b/!_UnrealScript_And_Stuff/Engine/Classes/Actor.uc
+@@ -918,10 +918,10 @@ native final function string GetUrlOption(string Option);
+ // Rendering.
+ 
+ native final function plane GetRenderBoundingSphere();
+-native final function DrawDebugLine( vector LineStart, vector LineEnd, byte R, byte G, byte B); // SLOW! Use for debugging only!
++native final function DrawDebugLine( vector LineStart, vector LineEnd, byte R, byte G, byte B, optional bool staying); // SLOW! Use for debugging only!
+ native final function DrawStayingDebugLine( vector LineStart, vector LineEnd, byte R, byte G, byte B); // SLOW! Use for debugging only!
+-native final function DrawDebugCircle( vector Base, vector X, vector Y, float Radius, int NumSides, byte R, byte G, byte B); // SLOW! Use for debugging only!
+-native final function DrawDebugSphere( vector Base, float Radius, int NumDivisions, byte R, byte G, byte B); // SLOW! Use for debugging only!
++native final function DrawDebugCircle( vector Base, vector X, vector Y, float Radius, int NumSides, byte R, byte G, byte B, optional bool staying); // SLOW! Use for debugging only!
++native final function DrawDebugSphere( vector Base, float Radius, int NumDivisions, byte R, byte G, byte B, optional bool staying); // SLOW! Use for debugging only!
+ native final function ClearStayingDebugLines();
+ 
+ //=========================================================================
+@@ -1044,7 +1044,7 @@ native final function bool PauseStream(  int Handle
+ 
+ // only used for level music - will be stopped when level changes
+ // Song parameter should not include extension (assumes .ogg)
+-native final function int PlayMusic( string Song, optional float FadeInTime );
++native final function int PlayMusic( string Song, optional float FadeInTime, optional float FadeOutTime, optional bool bCrossFade, optional float SeekTime );
+ 
+ native final function StopMusic( int SongHandle, optional float FadeOutTime );
+ native final function StopAllMusic( optional float FadeOutTime );
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 9621006..81be48f 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -455,19 +455,21 @@ exit=1
+ The live dedicated server runs OldUnreal's 3374 Linux patch; 3369-era data boots
+ this engine but 3374 data aborted at the first unbound native
+ (`Can't find 'intUObjectexecRandRange' in 'Core.dll'`). This phase enumerates the
+-**complete** 3374 native surface offline, implements it in the engine source, and
++3374 native declarations offline, implements the client-runtime gaps, and
+ makes binding failures diagnosable instead of fatal-at-first.
+ 
+ ### Enumeration (evidence: wrapper `build/phase12/`)
+ 
+ - Offline diff: every 3374 `.u` export table is decoded and compared against the
+   generated static registry (`Launch/Src/wasm-registry.py` output). Tool: the
+-  package decoder used for this phase; results in `missing-natives.txt`
+-  (49 entries: 6 Core natives, 1 Engine class + 18 Engine functions, 2 IpDrv
+-  classes + 2 functions, 2 XInterface functions, 16 Onslaught classes + 1
+-  function) with, for each, the package export index, the owning class, iNative,
+-  the exact UnrealScript signature, and the binary address / helper used to
+-  reconstruct behaviour.
++  `scripts/phase12-native-census.py`; results in `missing-natives.txt` preserve the
++  original 49 runtime entries (6 Core natives, 1 Engine class + 18 functions,
++  3 IpDrv classes + 2 functions, 2 XInterface functions, 16 Onslaught classes +
++  1 function), signatures and derivation sources. The exhaustive installer-tree
++  census also records 14 editor-only classes and 14 editor-only functions not
++  linked into this client; it does not claim editor support.
++  `changed-native-signatures.json` compares existing natives across both eras:
++  PlayMusic and three debug drawing functions gained optional arguments.
+ - Runtime cross-check: `WASM_VERIFY_NATIVES=1` makes binding log-and-continue and
+   sweeps the whole package set, so the runtime list can be compared against the
+   offline list. Log before the fixes: `verify-natives-before.log`.
+@@ -487,9 +489,9 @@ makes binding failures diagnosable instead of fatal-at-first.
+ 
+ ### Implemented natives (all regular implementations, no `#if __EMSCRIPTEN__`)
+ 
+-Reconstructed from the 3374 package signatures, the shipped `.so` disassembly,
+-the engine's own helpers, and the public OldUnreal source lineage (no unofficial
+-mirrors). Behaviour notes per family:
++Reconstructed from the 3374 package signatures, shipped `.so` disassembly,
++and existing engine helpers. OldUnreal's patch source is not published;
++no unofficial source mirrors were used.
+ 
+ - `Core/Object.uc`: `RandRange` (`Min + (Max-Min)*appFrand()`, matching the
+   `FRange::GetRand` convention), `FloatToFormattedString` (`%%.%df` with the
+@@ -519,14 +521,15 @@ mirrors). Behaviour notes per family:
+   implemented against the same colour-code convention as the shipped
+   `FString::CreateColorCode`/`StripColorCodes`/`FromINIFormat`
+   (leading `0x1B`, channels clamped to a minimum of 1, `(#RRGGBB)` → code);
+-  `GetCurrentTickRate`/`GetConfiguredTickRate` read the engine tick rate and the
+-  net driver's `NetServerMaxTickRate`.
++  `GetCurrentTickRate` reads `CurrentTickRate`, maintained by the browser loop.
++  `GetConfiguredTickRate` reads `NetServerMaxTickRate` when connected, otherwise
++  client menu/offline limits (120/1000 defaults recovered from Engine.so).
+ - `IpDrv`: `AMasterServerUplink::NetworkConnect` (creates and connects
+   `FMasterServerUplinkLink` exactly as the shipped `execReconnect` does),
+   `AMasterServerClientLauncher` native class + `SetResultCount`.
+-- `XInterface`: `UGUIController::NotifyMenuStatus` (accepted no-op hook with the
+-  shipped argument list), `UGUIFont::GetFontB` (sets `parm_YRes` from the
+-  property system, then forwards to `GetFont`).
++- `XInterface`: `UGUIController::NotifyMenuStatus` stores the parsed 32-bit bool
++  in analyst-named `UClient::bMenuOpen`; Engine.so uses it to choose menu/offline
++  frame limits. `UGUIFont::GetFontB` sets `parm_YRes` before forwarding to GetFont.
+ - `Onslaught`: the 16 native classes the package declares are compiled from the
+   in-tree sources; `AONSWheeledCraft::IMPLEMENT_CLASS` is re-enabled (its
+   on-disk registration was commented out).
+@@ -535,21 +538,38 @@ Module list: the Node link now covers Core, Engine, IpDrv, UWeb, Onslaught, Fire
+ XGame and XInterface; `Onslaught/Src/Onslaught.cpp` registers its names from the
+ launcher under Emscripten instead of a pre-runtime global constructor.
+ 
++### Layout and existing-native compatibility
++
++- Compiler-owned native layout metadata anchors reflected fields in Engine,
++  IpDrv and XInterface and the 32-bit SoundData payload. Both package eras use
++  actual C++ offsets, sizes and bool masks; omitted legacy fields retain space.
++  Actor's reordered octree/NetInitialCache block is anchored field by field.
++  The failing GC reference was `DefaultPhysicsVolume.Deleted` at offset 260,
++  reading octree float bits as an object pointer.
++- PlayMusic consumes all five 3374 arguments, including zero-default fade-out,
++  crossfade and seek. Playback fades/stops existing music, clears queued tracks,
++  delays non-crossfaded playback until fade-out completes, and preserves seek.
++  The legacy two-argument bytecode still parses correctly through the normal
++  end-of-parameters handling. Raw Engine.so assembly is in the wrapper evidence.
++- DrawDebugLine/Circle/Sphere consume the new optional `staying` bool; all four
++  debug primitives, including DrawDebugBox, support persistent geometry cleared
++  by ClearStayingLines. Existing tessellation is reused.
++- Temporary layout, GC-reference and bad-opcode probes were removed.
++
+ ### Result
+ 
+-- **3369 regression stays green**: `env -u WASM_SKIP_GC UT2004_BASE=$PWD/data3369/UT2004/System
+-  node build/ut2004.js` reaches `Unreal engine initialized` → `bounded loop
+-  complete` → `WASM: clean exit`, exit 0 (log: wrapper
+-  `build/phase12/node-3369-final.log`).
+-- **3374 still does not boot**: the native-binding failures are gone (XGame,
+-  Fire and XInterface natives now resolve), and the client now reaches
+-  `UnrealGame.u` class linking before failing with
+-  `RuntimeError: null function or function signature mismatch` inside
+-  `UStruct::Link`. Root cause is *not* a missing native: the 3374 packages
+-  declare native-class property chains that the C++ headers do not mirror
+-  (e.g. `Engine.Actor` gains `NetInitialCache` and `RotationRemainder`), and
+-  `UStruct::Link(Ar, 1)` derives property offsets from the package's own
+-  `Children` order, so every C++ member after the first insertion drifts.
+-  57 native classes drift between 3369 and 3374; the full list is
+-  `build/phase12/3374-native-class-layout-drift.txt`. This is the remaining
+-  blocker and it is a layout port, not a native-by-native port.
++- Final Node acceptance, GC enabled: 3374 **4.828257 s**, 3369 **5.385955 s**;
++  both exit 0 with initialization, NvidiaLogo browse, bounded-loop and clean-exit
++  markers. Evidence: `node-{3374,3369}-final-accepted.{log,json}`.
++- pve Chrome DM-Rankin: 3374 first frame **73473.100 ms**, 3369
++  **81189.800 ms**; both render, accept keyboard/mouse input and shut down with
++  exit 0. GL/WebGL errors are zero. Raw frames/readbacks and harness logs:
++  `browser-{3374,3369}-accepted/`.
++- Two locally served 3374 clients joined the unchanged live relay/server from
++  two windows of one pve Chrome. Spawn times **106153/104575 ms**; both transport
++  failure flags false, with signon/HUD/scoreboard evidence in
++  `local-3374-multiplayer-resolution-fix/`. No mesa browser was used.
++- The wrapper startup resize now waits for connected client state rather than
++  treating a map-loading screenshot as a ready frame. This prevents its
++  five-second resize fallback from reloading during asynchronous map loading.
++- Editor.TransBuffer remains an explicit, nonfatal editor-only import warning.
+diff --git a/Core/Inc/UnClass.h b/Core/Inc/UnClass.h
+index c784bc9..4223fbc 100644
+--- a/Core/Inc/UnClass.h
++++ b/Core/Inc/UnClass.h
+@@ -19,6 +19,28 @@
+ // Boundary to align class properties on.
+ enum {PROPERTY_ALIGNMENT=4};
+ 
++// Compiler-authored storage layout for reflected native structs and classes.
++struct FNativePropertyLayout
++{
++	const TCHAR* PropertyName;
++	INT Offset;
++	INT NativeSize;
++	INT NativeArrayDim;
++	DWORD BitMask;
++	UBOOL bOverrideBitMask;
++};
++struct FNativeStructLayout
++{
++	const TCHAR* PackageName;
++	const TCHAR* OuterName;
++	const TCHAR* StructName;
++	INT NativeSize;
++	const FNativePropertyLayout* Properties;
++	INT PropertyCount;
++	FNativeStructLayout* Next;
++};
++CORE_API void RegisterNativeStructLayout( FNativeStructLayout* Layout );
++
+ /*-----------------------------------------------------------------------------
+ 	FRepRecord.
+ -----------------------------------------------------------------------------*/
+diff --git a/Core/Src/UnClass.cpp b/Core/Src/UnClass.cpp
+index 11c2072..d3d5562 100644
+--- a/Core/Src/UnClass.cpp
++++ b/Core/Src/UnClass.cpp
+@@ -8,6 +8,57 @@
+ 
+ #include "CorePrivate.h"
+ 
++
++static FNativeStructLayout* GNativeStructLayouts = NULL;
++
++void RegisterNativeStructLayout( FNativeStructLayout* Layout )
++{
++	check(Layout && Layout->PackageName && Layout->StructName && Layout->NativeSize>0);
++	check(Layout->PropertyCount>=0 && (!Layout->PropertyCount || Layout->Properties));
++	for( FNativeStructLayout* Existing=GNativeStructLayouts; Existing; Existing=Existing->Next )
++	{
++		if( !appStricmp(Existing->PackageName,Layout->PackageName)
++		&&	((!Existing->OuterName && !Layout->OuterName)
++			|| (Existing->OuterName && Layout->OuterName && !appStricmp(Existing->OuterName,Layout->OuterName)))
++		&&	!appStricmp(Existing->StructName,Layout->StructName) )
++		{
++			check(Existing->NativeSize==Layout->NativeSize);
++			return;
++		}
++	}
++	Layout->Next = GNativeStructLayouts;
++	GNativeStructLayouts = Layout;
++}
++
++static const FNativeStructLayout* FindNativeStructLayout( const UStruct* Struct )
++{
++	UObject* Outer = Struct->GetOuter();
++	UObject* Parent = Outer ? Outer->GetOuter() : NULL;
++	UObject* Package = Parent ? Parent : Outer;
++	if( !Outer || !Package )
++		return NULL;
++	for( FNativeStructLayout* Layout=GNativeStructLayouts; Layout; Layout=Layout->Next )
++	{
++		if( !appStricmp(Struct->GetName(),Layout->StructName)
++		&&	((!Layout->OuterName && !Parent)
++			|| (Layout->OuterName && Parent && !appStricmp(Outer->GetName(),Layout->OuterName)))
++		&&	!appStricmp(Package->GetName(),Layout->PackageName) )
++			return Layout;
++	}
++	return NULL;
++}
++
++static const FNativePropertyLayout* GetNativePropertyLayout( const FNativeStructLayout* Layout, const TCHAR* PropertyName )
++{
++	if( Layout )
++	{
++		for( INT i=0; i<Layout->PropertyCount; i++ )
++			if( !appStricmp(Layout->Properties[i].PropertyName,PropertyName) )
++				return &Layout->Properties[i];
++	}
++	return NULL;
++}
++
+ #define VF_HASH_VARIABLES 0 /* Undecided!! */
+ 
+ /*-----------------------------------------------------------------------------
+@@ -358,26 +409,29 @@ void UStruct::Register()
+ void UStruct::Link( FArchive& Ar, UBOOL Props )
+ {
+ 	guard(UStruct::Link);
+-
+ 	// Link the properties.
+ 	guard(LinkProperties);
+ 	if( Props )
+ 	{
++		const FNativeStructLayout* NativeLayout = FindNativeStructLayout(this);
+ 		PropertiesSize = 0;
+-		if( GetInheritanceSuper() )
++		UStruct* InheritanceSuper = GetInheritanceSuper();
++		if( InheritanceSuper )
+ 		{
+-			Ar.Preload( GetInheritanceSuper() );
++			Ar.Preload( InheritanceSuper );
++			INT InheritanceSuperSize = InheritanceSuper->GetPropertiesSize();
+ 			#if FORCE_EXTREME_PACKING
+-				PropertiesSize = GetInheritanceSuper()->GetPropertiesSize();
++				PropertiesSize = InheritanceSuperSize;
+ 			#else
+-				PropertiesSize = Align(GetInheritanceSuper()->GetPropertiesSize(),4);
++				PropertiesSize = Align(InheritanceSuperSize,4);
+ 			#endif
+ 		}
+ 		UProperty* Prev = NULL;
+ 		for( UField* Field=Children; Field; Field=Field->Next )
+ 		{
+ 			Ar.Preload( Field );
+-			if( Field->GetOuter()!=this )
++			UObject* FieldOuter = Field->GetOuter();
++			if( FieldOuter!=this )
+ 				break;
+ 			UProperty* Property = Cast<UProperty>( Field );
+ 			if( Property )
+@@ -388,7 +442,25 @@ void UStruct::Link( FArchive& Ar, UBOOL Props )
+                     PropertiesSize = 7 * sizeof(PTRINT);
+ #endif
+ 				Property->Link( Ar, Prev );
+-				PropertiesSize = Property->Offset + Property->GetSize();
++				const FNativePropertyLayout* NativeProperty = GetNativePropertyLayout(NativeLayout,Property->GetName());
++				if( NativeProperty )
++				{
++					if( NativeProperty->NativeArrayDim )
++						check(Property->ArrayDim<=NativeProperty->NativeArrayDim);
++					if( NativeProperty->Offset!=INDEX_NONE )
++						Property->Offset = NativeProperty->Offset;
++					if( NativeProperty->bOverrideBitMask )
++					{
++						UBoolProperty* BoolProperty = Cast<UBoolProperty>(Property);
++						check(BoolProperty);
++						BoolProperty->BitMask = NativeProperty->BitMask;
++					}
++					INT NativePropertySize = NativeProperty->NativeSize ? NativeProperty->NativeSize : Property->GetSize();
++					check(NativePropertySize>=Property->GetSize());
++					PropertiesSize = Property->Offset + NativePropertySize;
++				}
++				else
++					PropertiesSize = Property->Offset + Property->GetSize();
+ 				Prev = Property;
+ 			}
+ 		}
+@@ -396,6 +468,11 @@ void UStruct::Link( FArchive& Ar, UBOOL Props )
+ 		#if !FORCE_EXTREME_PACKING
+ 			PropertiesSize = Align(PropertiesSize,4);
+ 		#endif
++		INT NativeStructSize = NativeLayout ? NativeLayout->NativeSize : 0;
++		if( NativeStructSize>PropertiesSize )
++		{
++			PropertiesSize = NativeStructSize;
++		}
+ 	}
+ 	else
+ 	{
+@@ -420,6 +497,7 @@ void UStruct::Link( FArchive& Ar, UBOOL Props )
+ 	}
+ 	unguard;
+ 
++
+ 	// Link the references, structs, and arrays for optimized cleanup.
+ 	// Note: Could optimize further by adding UProperty::NeedsDynamicRefCleanup, excluding things like arrays of ints.
+ 	guard(LinkRefs);
+@@ -511,9 +589,11 @@ void UStruct::SerializeBin( FArchive& Ar, BYTE* Data, INT MaxReadBytes )
+ 		}
+ 		if( It->ShouldSerializeValue(Ar) )
+ 			for( Index=0; Index<It->ArrayDim; Index++ )
+-			{				
++			{
+ 				if( Ar.LicenseeVer() >= 0x1c || !MaxReadBytes || !Ar.IsLoading() || Ar.Tell() < MaxReadPos )
++				{
+ 					It->SerializeItem( Ar, Data + It->Offset + Index*It->ElementSize, 0 );
++				}
+ 				else
+ 					debugf( NAME_Warning, TEXT("Binary-serialized struct property %s of %s does not exist on disk.  Skipping."), It->GetName(), GetName() );
+ 			}
+@@ -1029,7 +1109,6 @@ void UClass::Serialize( FArchive& Ar )
+ 
+ 	if( Ar.Ver() >= 99 )
+ 		Ar << HideCategories;
+-
+ 	// Defaults.
+ 	if( Ar.IsLoading() )
+ 	{
+diff --git a/Engine/Inc/EngineClasses.h b/Engine/Inc/EngineClasses.h
+index 8e48867..af6cbe1 100644
+--- a/Engine/Inc/EngineClasses.h
++++ b/Engine/Inc/EngineClasses.h
+@@ -1810,6 +1810,7 @@ public:
+     FName Group;
+     TArrayNoInit<class AActor*> Touching;
+     TArrayNoInit<PTRINT> OctreeNodes;
++    PTRINT NetInitialCache;
+     FBox OctreeBox;
+     FVector OctreeBoxCenter;
+     FVector OctreeBoxRadii;
+@@ -1822,6 +1823,7 @@ public:
+     FRotator Rotation;
+     FVector Velocity;
+     FVector Acceleration;
++    FRotator RotationRemainder;
+     FVector CachedLocation;
+     FRotator CachedRotation;
+     FMatrix CachedLocalToWorld;
+@@ -2855,6 +2857,7 @@ public:
+     FStringNoInit AdminName;
+     FStringNoInit AdminEmail;
+     INT ServerRegion;
++    FStringNoInit FQDN;
+     FStringNoInit MessageOfTheDay;
+     FStringNoInit MOTDLine1;
+     FStringNoInit MOTDLine2;
+@@ -2864,8 +2867,8 @@ public:
+     class AVoiceChatReplicationInfo* VoiceReplicationInfo;
+     class UTexture* TeamSymbols[2];
+     TArrayNoInit<class APlayerReplicationInfo*> PRIArray;
+-    FStringNoInit GRIPropsDisplayText[4];
+-    FStringNoInit GRIPropDescText[4];
++    FStringNoInit GRIPropsDisplayText[5];
++    FStringNoInit GRIPropDescText[5];
+     FVector FlagPos;
+     BYTE FlagState[2];
+     class APlayerReplicationInfo* FlagHolder[2] GCC_PACK(4);
+@@ -3395,6 +3398,7 @@ public:
+     class UObjectPool* ObjectPool;
+     TArrayNoInit<class UMaterial*> PrecacheMaterials;
+     TArrayNoInit<class UStaticMesh*> PrecacheStaticMeshes;
++    TArrayNoInit<class UPackageMap*> OfflinePackageMap;
+     class UStaticMesh* IndoorCamouflageMesh;
+     FLOAT IndoorMeshDrawscale;
+     class UStaticMesh* OutdoorCamouflageMesh;
+@@ -5601,6 +5605,7 @@ public:
+     FStringNoInit DeathString GCC_PACK(4);
+     FStringNoInit FemaleSuicide;
+     FStringNoInit MaleSuicide;
++    FStringNoInit ThemSuicide;
+     FLOAT ViewFlash;
+     FVector ViewFog;
+     class UClass* DamageEffect;
+@@ -5916,7 +5921,7 @@ public:
+     FVector MonitorStartLoc;
+     class APawn* MonitoredPawn;
+     FLOAT MonitorMaxDistSq;
+-    class AAvoidMarker* FearSpots[2];
++    class AAvoidMarker* FearSpots[10];
+     FLOAT WarningDelay;
+     class AProjectile* WarningProjectile;
+     class APawn* ShotTarget;
+@@ -5926,6 +5931,7 @@ public:
+     FLOAT Adrenaline;
+     FLOAT AdrenalineMax;
+     class UClass* LastPawnWeapon;
++    FLOAT SPCTimeStamp;
+     DECLARE_FUNCTION(execCanMakePathTo);
+     DECLARE_FUNCTION(execEndClimbLadder);
+     DECLARE_FUNCTION(execStopWaiting);
+@@ -6380,6 +6386,7 @@ public:
+     BITFIELD bShortConnectTimeOut:1;
+     BITFIELD bPendingDestroy:1;
+     BITFIELD bEnableAmbientShake:1;
++    BITFIELD bShownNoChatRoomMsg:1;
+     BITFIELD bNoVoiceMessages:1;
+     BITFIELD bNoTextToSpeechVoiceMessages:1;
+     BITFIELD bNoVoiceTaunts:1;
+@@ -6446,6 +6453,8 @@ public:
+     INT ShowFlags GCC_PACK(4);
+     INT Misc1;
+     INT Misc2;
++    PTRINT MiscPointer1;
++    PTRINT MiscPointer2;
+     INT RendMap;
+     FLOAT OrthoZoom;
+     class AActor* ViewTarget;
+@@ -6458,6 +6467,7 @@ public:
+     TArrayNoInit<class UCameraEffect*> CameraEffects;
+     FLOAT DesiredFOV;
+     FLOAT DefaultFOV;
++    FLOAT HorizPlusFOVScale;
+     FLOAT ZoomLevel;
+     FLOAT DesiredZoomLevel;
+     FVector ListenerLocation;
+@@ -6589,6 +6599,23 @@ public:
+     FStringNoInit LastBroadcastString[4];
+     FLOAT LastSpeedHackLog;
+     FStringNoInit PlayerOwnerName;
++    INT SSTOCalls;
++    INT SSTOCritical;
++    INT SwitchCount;
++    INT SUCalls;
++    INT VCCount;
++    FLOAT SSTOTimestamp;
++    FLOAT SwitchTimestamp;
++    FLOAT SUTimeStamp;
++    FLOAT VCTimeStamp;
++    BITFIELD bSSTOKicked:1 GCC_PACK(4);
++    BITFIELD bTempSpec:1;
++    BITFIELD bTogglescreenshotmodeOn:1;
++    FLOAT savedHandedness GCC_PACK(4);
++    BITFIELD savedbCrosshairShow:1 GCC_PACK(4);
++    BITFIELD savedbHideHUD:1;
++    FLOAT savedTeamBeaconMaxDist GCC_PACK(4);
++    BITFIELD savedbHideVehicleNoEntryIndicator:1 GCC_PACK(4);
+     DECLARE_FUNCTION(execClientHearSound);
+     DECLARE_FUNCTION(execFindStairRotation);
+     DECLARE_FUNCTION(execCheckSpeedHack);
+@@ -6864,6 +6891,7 @@ public:
+     BITFIELD bTossedOut:1;
+     class UClass* PickupClass GCC_PACK(4);
+     INT Charge;
++    INT IteratorTag;
+     FVector PlayerViewOffset;
+     FRotator PlayerViewPivot;
+     BITFIELD bDrawingFirstPerson:1 GCC_PACK(4);
+diff --git a/Engine/Inc/UnAudio.h b/Engine/Inc/UnAudio.h
+index 0523d7f..83326a8 100644
+--- a/Engine/Inc/UnAudio.h
++++ b/Engine/Inc/UnAudio.h
+@@ -157,7 +157,7 @@ class ENGINE_API UAudioSubsystem : public USubsystem
+ 	// Music playback.
+ 	INT PlayStream( FString Filename, UBOOL UseMusicVolume, FLOAT InVolume, FLOAT FadeInTime, FLOAT SeekTime );
+ 	virtual INT SeekStream( INT Handle, FLOAT Time ){ return 0; }
+-	INT PlayMusic( FString Song, FLOAT FadeInTime );
++	INT PlayMusic( FString Song, FLOAT FadeInTime, FLOAT FadeOutTime, UBOOL CrossFade, FLOAT SeekTime );
+ 	void AllowMusicPlayback( UBOOL Allow );
+ 
+ 	// rjp --
+@@ -191,6 +191,9 @@ protected:
+ 	UBOOL		LastRealtime,
+ 				AllowMusic;
+ 	FString		PendingSong;
++	FString		DelayedSong;
++	FLOAT		MusicDelay, DelayedFadeInTime, DelayedSeekTime;
++	UBOOL		MusicTransitionPending;
+ 
+ 	TArray<FSoundSource*> QueuedSources;
+ 
+diff --git a/Engine/Inc/UnCamera.h b/Engine/Inc/UnCamera.h
+index a8752ee..15ae446 100644
+--- a/Engine/Inc/UnCamera.h
++++ b/Engine/Inc/UnCamera.h
+@@ -508,6 +508,11 @@ class ENGINE_API UClient : public UObject
+ 
+ 	class UInteractionMaster* InteractionMaster;	// Input router
+ 
++	// Retained native menu status set by UGUIController::NotifyMenuStatus.
++	UBOOL			bMenuOpen;	// Analyst-derived name; the shipped native field name is unavailable.
++	INT				MaxMenuFrameRate;
++	INT				MaxOfflineFrameRate;
++
+ 	// Constructors.
+ 	UClient();
+ 	void StaticConstructor();
+diff --git a/Engine/Src/UnAudio.cpp b/Engine/Src/UnAudio.cpp
+index c4c1c4a..fc090c6 100644
+--- a/Engine/Src/UnAudio.cpp
++++ b/Engine/Src/UnAudio.cpp
+@@ -11,6 +11,22 @@ Revision history:
+ #include "EnginePrivate.h" 
+ #include "UnNet.h"
+ 
++#if PLATFORM_32BITS
++// UT2004 3374 serializes FSoundData as a struct but omits its four ABI padding words.
++static FNativeStructLayout GSoundDataNativeLayout =
++{
++	TEXT("Engine"), TEXT("Sound"), TEXT("SoundData"), sizeof(FSoundData), NULL, 0, NULL
++};
++struct FRegisterSoundDataNativeLayout
++{
++	FRegisterSoundDataNativeLayout()
++	{
++		RegisterNativeStructLayout(&GSoundDataNativeLayout);
++	}
++};
++static FRegisterSoundDataNativeLayout GRegisterSoundDataNativeLayout;
++#endif
++
+ // Shared thread safe audio capture device.
+ FAudioCaptureDevice* UAudioSubsystem::CaptureDevice = NULL;
+ 
+@@ -49,7 +65,7 @@ void UAudioSubsystem::PostEditChange()
+ 
+ 	// Start music if necessary.
+ 	if( PendingSong != TEXT("") && MusicVolume > 0.f )
+-		PlayMusic( PendingSong, 0.f );
++		PlayMusic( PendingSong, 0.f, 0.f, 0, 0.f );
+ 
+ 	unguard;
+ }
+@@ -126,6 +142,17 @@ UBOOL UAudioSubsystem::Update( FSceneNode* SceneNode )
+ 	LastUpdateTime	= Viewport->CurrentTime;
+ 	DeltaTime		= Clamp(DeltaTime,0.0001f,1.0f);
+ 
++	if( MusicTransitionPending )
++	{
++		MusicDelay -= DeltaTime;
++		if( MusicDelay <= 0.f )
++		{
++			MusicTransitionPending = 0;
++			PlayMusic( DelayedSong, DelayedFadeInTime, 0.f, 0, DelayedSeekTime );
++			DelayedSong = TEXT("");
++		}
++	}
++
+ 	// Gather information needed to update listener.
+ 	ALevelInfo*		LevelInfo	= Viewport->Actor->GetViewTarget()->Level;
+ 	FPointRegion	Region		= Level->Model->PointRegion( LevelInfo, SceneNode->ViewOrigin );
+@@ -433,7 +460,7 @@ INT UAudioSubsystem::PlayStream( FString Filename, UBOOL UseMusicVolume, FLOAT I
+ //
+ //	UAudioSubsystem::PlayMusic
+ //
+-INT UAudioSubsystem::PlayMusic( FString Song, FLOAT FadeInTime )
++INT UAudioSubsystem::PlayMusic( FString Song, FLOAT FadeInTime, FLOAT FadeOutTime, UBOOL CrossFade, FLOAT SeekTime )
+ {
+ 	guard(UAudioSubsystem::PlayMusic);
+ 	// Start music.
+@@ -457,7 +484,47 @@ INT UAudioSubsystem::PlayMusic( FString Song, FLOAT FadeInTime )
+ 				FString Filename = GSys->MusicPath(i) + FString(TEXT("\\")) + Song + FString(TEXT(".ogg"));
+ 				if ( GFileManager->FileSize( *Filename ) > 0 )
+ 				{
++					UBOOL FadingMusic = 0;
++					for( INT SourceIndex=0; SourceIndex<GetNumSources(); ++SourceIndex )
++					{
++						FSoundSource* Source = GetSource(SourceIndex);
++						if( !(Source->Flags & SF_Music) )
++							continue;
++						if( FadeOutTime > 0.f )
++						{
++							FLOAT FadeFraction = 0.f;
++							if( Source->FadeMode != FADE_None )
++							{
++								FadeFraction = Source->FadeTime / Source->FadeDuration;
++								if( Source->FadeMode == FADE_In )
++									FadeFraction = 1.f - FadeFraction;
++							}
++							Source->FadeTime = FadeFraction * FadeOutTime;
++							Source->FadeDuration = FadeOutTime;
++							Source->FadeMode = FADE_Out;
++							FadingMusic = 1;
++						}
++						else
++							Source->Stop();
++					}
++					for( INT SourceIndex=0; SourceIndex<QueuedSources.Num(); ++SourceIndex )
++						if( QueuedSources(SourceIndex)->Flags & SF_Music )
++						{
++							delete QueuedSources(SourceIndex);
++							QueuedSources.Remove(SourceIndex--);
++						}
++					if( !CrossFade && FadingMusic )
++					{
++						DelayedSong = Song;
++						MusicDelay = FadeOutTime;
++						DelayedFadeInTime = FadeInTime;
++						DelayedSeekTime = SeekTime;
++						MusicTransitionPending = 1;
++						return 0;
++					}
++					MusicTransitionPending = 0;
+ 					USound* Music = new USound( *Filename, SF_Streaming | SF_Music );
++					Music->InitialSeekTime = SeekTime;
+ 					PlaySound( NULL, 2*SLOT_None | 1, Music, FVector(0,0,0), Clamp(Volume,0.f,1.f), 1000, 1.f, SF_Streaming | SF_No3D | SF_Music | SF_MusicVolume, FadeInTime );
+ 					return Music->GetIndex();
+ 				}
+@@ -573,6 +640,7 @@ void UAudioSubsystem::StopStream( INT SongHandle, FLOAT FadeOutTime )
+ void UAudioSubsystem::StopAllMusic( FLOAT FadeOutTime )
+ {
+ 	guard(UAudioSubsystem::StopAllMusic);
++	MusicTransitionPending = 0;
+ 	for( INT i=0; i<GetNumSources(); i++ )
+ 		if( GetSource(i)->Flags & SF_Music )
+ 			GetSource(i)->Stop();
+diff --git a/Engine/Src/UnCamMgr.cpp b/Engine/Src/UnCamMgr.cpp
+index 485ff1e..c81e5ac 100644
+--- a/Engine/Src/UnCamMgr.cpp
++++ b/Engine/Src/UnCamMgr.cpp
+@@ -43,6 +43,9 @@ void UClient::StaticConstructor()
+ {
+ 	guard(UClient::StaticConstructor);
+ 
++	MaxMenuFrameRate = 120;
++	MaxOfflineFrameRate = 1000;
++
+ 	PTextureDetail = new(GetClass(),TEXT("ETextureDetail"))UEnum( NULL );
+ 
+ 	new(PTextureDetail->Names)FName( TEXT("UltraHigh")); // +4
+@@ -65,6 +68,8 @@ void UClient::StaticConstructor()
+ 	new(GetClass(),TEXT("Contrast"),			RF_Public)UFloatProperty(CPP_PROPERTY(Contrast				), TEXT("Display"), CPF_Config );
+ 	new(GetClass(),TEXT("Gamma"),				RF_Public)UFloatProperty(CPP_PROPERTY(Gamma					), TEXT("Display"), CPF_Config );
+ 	new(GetClass(),TEXT("CaptureMouse"),		RF_Public)UBoolProperty (CPP_PROPERTY(CaptureMouse			), TEXT("Display"), CPF_Config );
++	new(GetClass(),TEXT("MaxMenuFrameRate"), RF_Public)UIntProperty(CPP_PROPERTY(MaxMenuFrameRate), TEXT("Display"), CPF_Config);
++	new(GetClass(),TEXT("MaxOfflineFrameRate"), RF_Public)UIntProperty(CPP_PROPERTY(MaxOfflineFrameRate), TEXT("Display"), CPF_Config);
+ 
+     new(GetClass(),TEXT("TextureDetailWorld"),              RF_Public)UByteProperty (CPP_PROPERTY(TextureLODSet[LODSET_World]           ), TEXT("Display"), CPF_Config, PTextureDetail );
+     new(GetClass(),TEXT("TextureDetailPlayerSkin"),         RF_Public)UByteProperty (CPP_PROPERTY(TextureLODSet[LODSET_PlayerSkin]      ), TEXT("Display"), CPF_Config, PTextureDetail );
+diff --git a/Engine/Src/UnGame.cpp b/Engine/Src/UnGame.cpp
+index 045af3a..7c0d697 100644
+--- a/Engine/Src/UnGame.cpp
++++ b/Engine/Src/UnGame.cpp
+@@ -21,6 +21,143 @@ IMPLEMENT_CLASS(UCrosshairPack);
+ IMPLEMENT_CLASS(APrecacheHack);
+ IMPLEMENT_CLASS(AMaplistManagerBase);
+ 
++#if PLATFORM_32BITS
++// Native-class layout metadata keeps reflected package fields anchored to the
++// compiler's storage when a package omits fields added in a later engine build.
++#define NATIVE_LAYOUT_FIELD(Class,Member) \
++	{ TEXT(#Member), STRUCT_OFFSET(Class,Member), sizeof(((Class*)0)->Member), 0, 0, 0 }
++#define NATIVE_LAYOUT_ARRAY(Class,Member,Dim) \
++	{ TEXT(#Member), STRUCT_OFFSET(Class,Member), sizeof(((Class*)0)->Member), Dim, 0, 0 }
++#define NATIVE_LAYOUT_BOOL_MASK(Name,Mask) \
++	{ TEXT(Name), INDEX_NONE, 0, 0, Mask, 1 }
++
++static FNativePropertyLayout GActorNativeProperties[] =
++{
++	NATIVE_LAYOUT_FIELD(AActor,NetInitialCache),
++	NATIVE_LAYOUT_FIELD(AActor,OctreeBox),
++	NATIVE_LAYOUT_FIELD(AActor,OctreeBoxCenter),
++	NATIVE_LAYOUT_FIELD(AActor,OctreeBoxRadii),
++	NATIVE_LAYOUT_FIELD(AActor,Deleted),
++	NATIVE_LAYOUT_FIELD(AActor,RotationRemainder),
++	NATIVE_LAYOUT_FIELD(AActor,CachedLocation)
++};
++static FNativeStructLayout GActorNativeLayout =
++{
++	TEXT("Engine"), NULL, TEXT("Actor"), sizeof(AActor),
++	GActorNativeProperties, sizeof(GActorNativeProperties)/sizeof(GActorNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GControllerNativeProperties[] =
++{
++	NATIVE_LAYOUT_ARRAY(AController,FearSpots,10),
++	NATIVE_LAYOUT_FIELD(AController,SPCTimeStamp)
++};
++static FNativeStructLayout GControllerNativeLayout =
++{
++	TEXT("Engine"), NULL, TEXT("Controller"), sizeof(AController),
++	GControllerNativeProperties, sizeof(GControllerNativeProperties)/sizeof(GControllerNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GPlayerControllerNativeProperties[] =
++{
++	NATIVE_LAYOUT_BOOL_MASK("bShownNoChatRoomMsg",((BITFIELD)1<<5)),
++	NATIVE_LAYOUT_BOOL_MASK("bNoVoiceMessages",((BITFIELD)1<<6)),
++	NATIVE_LAYOUT_FIELD(APlayerController,MiscPointer1),
++	NATIVE_LAYOUT_FIELD(APlayerController,MiscPointer2),
++	NATIVE_LAYOUT_FIELD(APlayerController,RendMap),
++	NATIVE_LAYOUT_FIELD(APlayerController,HorizPlusFOVScale),
++	NATIVE_LAYOUT_FIELD(APlayerController,ZoomLevel),
++	NATIVE_LAYOUT_FIELD(APlayerController,SSTOCalls),
++	NATIVE_LAYOUT_FIELD(APlayerController,SSTOCritical),
++	NATIVE_LAYOUT_FIELD(APlayerController,SwitchCount),
++	NATIVE_LAYOUT_FIELD(APlayerController,SUCalls),
++	NATIVE_LAYOUT_FIELD(APlayerController,VCCount),
++	NATIVE_LAYOUT_FIELD(APlayerController,SSTOTimestamp),
++	NATIVE_LAYOUT_FIELD(APlayerController,SwitchTimestamp),
++	NATIVE_LAYOUT_FIELD(APlayerController,SUTimeStamp),
++	NATIVE_LAYOUT_FIELD(APlayerController,VCTimeStamp),
++	NATIVE_LAYOUT_BOOL_MASK("bSSTOKicked",((BITFIELD)1<<0)),
++	NATIVE_LAYOUT_BOOL_MASK("bTempSpec",((BITFIELD)1<<1)),
++	NATIVE_LAYOUT_BOOL_MASK("bTogglescreenshotmodeOn",((BITFIELD)1<<2)),
++	NATIVE_LAYOUT_FIELD(APlayerController,savedHandedness),
++	NATIVE_LAYOUT_BOOL_MASK("savedbCrosshairShow",((BITFIELD)1<<0)),
++	NATIVE_LAYOUT_BOOL_MASK("savedbHideHUD",((BITFIELD)1<<1)),
++	NATIVE_LAYOUT_FIELD(APlayerController,savedTeamBeaconMaxDist),
++	NATIVE_LAYOUT_BOOL_MASK("savedbHideVehicleNoEntryIndicator",((BITFIELD)1<<0))
++};
++static FNativeStructLayout GPlayerControllerNativeLayout =
++{
++	TEXT("Engine"), NULL, TEXT("PlayerController"), sizeof(APlayerController),
++	GPlayerControllerNativeProperties, sizeof(GPlayerControllerNativeProperties)/sizeof(GPlayerControllerNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GInventoryNativeProperties[] =
++{
++	NATIVE_LAYOUT_FIELD(AInventory,IteratorTag),
++	NATIVE_LAYOUT_FIELD(AInventory,PlayerViewOffset)
++};
++static FNativeStructLayout GInventoryNativeLayout =
++{
++	TEXT("Engine"), NULL, TEXT("Inventory"), sizeof(AInventory),
++	GInventoryNativeProperties, sizeof(GInventoryNativeProperties)/sizeof(GInventoryNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GDamageTypeNativeProperties[] =
++{
++	NATIVE_LAYOUT_FIELD(ADamageType,ThemSuicide),
++	NATIVE_LAYOUT_FIELD(ADamageType,ViewFlash)
++};
++static FNativeStructLayout GDamageTypeNativeLayout =
++{
++	TEXT("Engine"), NULL, TEXT("DamageType"), sizeof(ADamageType),
++	GDamageTypeNativeProperties, sizeof(GDamageTypeNativeProperties)/sizeof(GDamageTypeNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GLevelInfoNativeProperties[] =
++{
++	NATIVE_LAYOUT_FIELD(ALevelInfo,OfflinePackageMap),
++	NATIVE_LAYOUT_FIELD(ALevelInfo,IndoorCamouflageMesh)
++};
++static FNativeStructLayout GLevelInfoNativeLayout =
++{
++	TEXT("Engine"), NULL, TEXT("LevelInfo"), sizeof(ALevelInfo),
++	GLevelInfoNativeProperties, sizeof(GLevelInfoNativeProperties)/sizeof(GLevelInfoNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GGameReplicationInfoNativeProperties[] =
++{
++	NATIVE_LAYOUT_FIELD(AGameReplicationInfo,FQDN),
++	NATIVE_LAYOUT_FIELD(AGameReplicationInfo,MessageOfTheDay),
++	NATIVE_LAYOUT_ARRAY(AGameReplicationInfo,GRIPropsDisplayText,5),
++	NATIVE_LAYOUT_ARRAY(AGameReplicationInfo,GRIPropDescText,5)
++};
++static FNativeStructLayout GGameReplicationInfoNativeLayout =
++{
++	TEXT("Engine"), NULL, TEXT("GameReplicationInfo"), sizeof(AGameReplicationInfo),
++	GGameReplicationInfoNativeProperties,
++	sizeof(GGameReplicationInfoNativeProperties)/sizeof(GGameReplicationInfoNativeProperties[0]), NULL
++};
++
++struct FRegisterEngineNativeLayouts
++{
++	FRegisterEngineNativeLayouts()
++	{
++		RegisterNativeStructLayout(&GActorNativeLayout);
++		RegisterNativeStructLayout(&GControllerNativeLayout);
++		RegisterNativeStructLayout(&GPlayerControllerNativeLayout);
++		RegisterNativeStructLayout(&GInventoryNativeLayout);
++		RegisterNativeStructLayout(&GDamageTypeNativeLayout);
++		RegisterNativeStructLayout(&GLevelInfoNativeLayout);
++		RegisterNativeStructLayout(&GGameReplicationInfoNativeLayout);
++	}
++};
++static FRegisterEngineNativeLayouts GRegisterEngineNativeLayouts;
++
++#undef NATIVE_LAYOUT_FIELD
++#undef NATIVE_LAYOUT_ARRAY
++#undef NATIVE_LAYOUT_BOOL_MASK
++#endif
++
+ const int XBoxRelaunch = 0; // sjs --- enables rebooting of xbox between level loads
+ extern int QueueScreenShot; // sjs - label hack
+ 
+diff --git a/Engine/Src/UnScript.cpp b/Engine/Src/UnScript.cpp
+index 004911c..1ebed5e 100644
+--- a/Engine/Src/UnScript.cpp
++++ b/Engine/Src/UnScript.cpp
+@@ -1888,6 +1888,9 @@ void AActor::execPlayMusic( FFrame& Stack, RESULT_DECL )
+ 	guardSlow(AActor::execPlayMusic);
+ 	P_GET_STR(Song);
+ 	P_GET_FLOAT_OPTX(FadeInTime,0.f);
++	P_GET_FLOAT_OPTX(FadeOutTime,0.f);
++	P_GET_UBOOL_OPTX(bCrossFade,0);
++	P_GET_FLOAT_OPTX(SeekTime,0.f);
+ 	P_FINISH;
+ 
+ 	if( ParseParam( appCmdLine(), TEXT("nomusic") ) )
+@@ -1897,7 +1900,7 @@ void AActor::execPlayMusic( FFrame& Stack, RESULT_DECL )
+     }    
+ 
+ 	if( GetLevel()->Engine->Audio )
+-		*(INT*)Result = GetLevel()->Engine->Audio->PlayMusic( Song, FadeInTime );
++		*(INT*)Result = GetLevel()->Engine->Audio->PlayMusic( Song, FadeInTime, FadeOutTime, bCrossFade, SeekTime );
+ 	else
+ 		*(INT*)Result = 0;
+ 
+@@ -3503,6 +3506,55 @@ void AActor::execGetRenderBoundingSphere(FFrame& Stack,RESULT_DECL)
+ 	unguardexec;
+ }
+ 
++// Persistent geometry uses the same tessellation as FLineBatcher and the existing staying-line buffer.
++static void AddStayingDebugCircle( FVector Base, FVector X, FVector Y, FColor Color, FLOAT Radius, INT NumSides )
++{
++	FLOAT AngleDelta = 2.0f * PI / NumSides;
++	FVector LastVertex = Base + X * Radius;
++	for( INT SideIndex=0; SideIndex<NumSides; SideIndex++ )
++	{
++		FVector Vertex = Base + (X * appCos(AngleDelta * (SideIndex + 1)) + Y * appSin(AngleDelta * (SideIndex + 1))) * Radius;
++		GTempLineBatcher->AddStayingLine(LastVertex,Vertex,Color);
++		LastVertex = Vertex;
++	}
++}
++
++static void AddStayingDebugSphere( FVector Base, FColor Color, FLOAT Radius, INT NumDivisions )
++{
++	FLOAT AngleDelta = 2.0f * PI / NumDivisions;
++	FLOAT SegmentDist = 2.0f * Radius / NumDivisions;
++	for( INT SideIndex=-NumDivisions/2; SideIndex<NumDivisions/2; SideIndex++ )
++		AddStayingDebugCircle(Base-FVector(0,0,SideIndex*SegmentDist),FVector(1,0,0),FVector(0,1,0),Color,appSqrt(Radius*Radius-SideIndex*SegmentDist*SideIndex*SegmentDist),NumDivisions);
++	for( INT SideIndex=0; SideIndex<NumDivisions; SideIndex++ )
++		AddStayingDebugCircle(Base,FVector(0,0,1),FVector(1,0,0)*appCos(AngleDelta*SideIndex)+FVector(0,1,0)*appSin(AngleDelta*SideIndex),Color,Radius,NumDivisions);
++}
++
++// Match FLineBatcher::DrawBox's 12 wireframe edges, retaining them in the persistent line buffer.
++static void AddStayingDebugBox( FBox Box, FColor Color )
++{
++	FVector B[2], P, Q;
++	B[0] = Box.Min;
++	B[1] = Box.Max;
++	for( INT i=0; i<2; i++ )
++		for( INT j=0; j<2; j++ )
++		{
++			P.X = B[i].X; Q.X = B[i].X;
++			P.Y = B[j].Y; Q.Y = B[j].Y;
++			P.Z = B[0].Z; Q.Z = B[1].Z;
++			GTempLineBatcher->AddStayingLine(P,Q,Color);
++
++			P.Y = B[i].Y; Q.Y = B[i].Y;
++			P.Z = B[j].Z; Q.Z = B[j].Z;
++			P.X = B[0].X; Q.X = B[1].X;
++			GTempLineBatcher->AddStayingLine(P,Q,Color);
++
++			P.Z = B[i].Z; Q.Z = B[i].Z;
++			P.X = B[j].X; Q.X = B[j].X;
++			P.Y = B[0].Y; Q.Y = B[1].Y;
++			GTempLineBatcher->AddStayingLine(P,Q,Color);
++		}
++}
++
+ //
+ //	AActor::execDrawDebugLine
+ //
+@@ -3516,9 +3568,13 @@ void AActor::execDrawDebugLine(FFrame& Stack,RESULT_DECL)
+ 	P_GET_BYTE(R);
+ 	P_GET_BYTE(G);
+ 	P_GET_BYTE(B);
++	P_GET_UBOOL_OPTX(bStaying,0);
+ 	P_FINISH;
+ 
+-	GTempLineBatcher->AddLine(LineStart, LineEnd, FColor(R, G, B));
++	if( bStaying )
++		GTempLineBatcher->AddStayingLine(LineStart,LineEnd,FColor(R,G,B));
++	else
++		GTempLineBatcher->AddLine(LineStart,LineEnd,FColor(R,G,B));
+ 
+ 	unguard;
+ }
+@@ -3565,9 +3621,13 @@ void AActor::execDrawDebugCircle(FFrame& Stack,RESULT_DECL)
+ 	P_GET_BYTE(R);
+ 	P_GET_BYTE(G);
+ 	P_GET_BYTE(B);
++	P_GET_UBOOL_OPTX(bStaying,0);
+ 	P_FINISH;
+ 
+-	GTempLineBatcher->AddCircle(Base, X, Y, FColor(R, G, B), Radius, NumSides);
++	if( bStaying )
++		AddStayingDebugCircle(Base,X,Y,FColor(R,G,B),Radius,NumSides);
++	else
++		GTempLineBatcher->AddCircle(Base,X,Y,FColor(R,G,B),Radius,NumSides);
+ 
+ 	unguard;
+ }
+@@ -3583,9 +3643,13 @@ void AActor::execDrawDebugSphere(FFrame& Stack,RESULT_DECL)
+ 	P_GET_BYTE(R);
+ 	P_GET_BYTE(G);
+ 	P_GET_BYTE(B);
++	P_GET_UBOOL_OPTX(bStaying,0);
+ 	P_FINISH;
+ 
+-	GTempLineBatcher->AddSphere(Base, FColor(R, G, B), Radius, NumDivisions);
++	if( bStaying )
++		AddStayingDebugSphere(Base,FColor(R,G,B),Radius,NumDivisions);
++	else
++		GTempLineBatcher->AddSphere(Base,FColor(R,G,B),Radius,NumDivisions);
+ 
+ 	unguard;
+ }
+@@ -3941,7 +4005,14 @@ void AActor::execDrawDebugBox( FFrame& Stack, RESULT_DECL )
+ 	P_GET_UBOOL_OPTX(bStaying, 0);
+ 	P_FINISH;
+ 	if( GTempLineBatcher )
+-		GTempLineBatcher->AddBox( FBox(DiagonalStart, DiagonalEnd), FColor(R, G, B) );
++	{
++		FBox Box(DiagonalStart, DiagonalEnd);
++		FColor Color(R, G, B);
++		if( bStaying )
++			AddStayingDebugBox(Box,Color);
++		else
++			GTempLineBatcher->AddBox(Box,Color);
++	}
+ 	unguardexecSlow;
+ }
+ 
+@@ -4193,12 +4264,18 @@ void AGameInfo::execGetConfiguredTickRate( FFrame& Stack, RESULT_DECL )
+ {
+ 	guardSlow(AGameInfo::execGetConfiguredTickRate);
+ 	P_FINISH;
+-	if( XLevel && XLevel->NetDriver )
+-		*(INT*)Result = XLevel->NetDriver->NetServerMaxTickRate;
+-	else if( XLevel && XLevel->Engine )
+-		*(INT*)Result = appRound( XLevel->Engine->GetMaxTickRate() );
+-	else
+-		*(INT*)Result = 0;
++	INT Rate = 0;
++	if( XLevel )
++	{
++		if( XLevel->NetDriver )
++			Rate = XLevel->NetDriver->NetServerMaxTickRate;
++		else if( XLevel->Engine && XLevel->Engine->Client )
++		{
++			UClient* Client = XLevel->Engine->Client;
++			Rate = Client->bMenuOpen ? Client->MaxMenuFrameRate : Client->MaxOfflineFrameRate;
++		}
++	}
++	*(INT*)Result = Rate;
+ 	unguardexecSlow;
+ }
+ 
+diff --git a/IpDrv/Inc/IpDrvClasses.h b/IpDrv/Inc/IpDrvClasses.h
+index 2be4906..b169f38 100644
+--- a/IpDrv/Inc/IpDrvClasses.h
++++ b/IpDrv/Inc/IpDrvClasses.h
+@@ -295,6 +295,10 @@ public:
+     TArrayNoInit<FtMasterServerEntry> MasterServerList;
+     TArrayNoInit<FtMasterServerEntry> ActiveMasterServerList;
+     INT LastMSIndex;
++    // 3374 reflected fields are placed at the tail; native layout metadata maps package order here.
++    INT myMasterServer;
++    INT MasterServerGroup;
++    BYTE MS_Status;
+     DECLARE_FUNCTION(execPoll);
+     void eventGetMasterServer(FString& OutAddress, INT& OutPort)
+     {
+@@ -453,6 +457,9 @@ public:
+     BITFIELD bLANQuery:1 GCC_PACK(4);
+     FScriptDelegate __OnReceivedPingInfo__Delegate GCC_PACK(4);
+     FScriptDelegate __OnPingTimeout__Delegate;
++    // 3374-only reflected state, stored after the 3369 native delegate layout.
++    INT lastMasterServerIndex;
++    TArrayNoInit<FResolveInfo*> PrivateResolveInfo;
+     DECLARE_FUNCTION(execNetworkError);
+     DECLARE_FUNCTION(execCancelPings);
+     DECLARE_FUNCTION(execPingServer);
+@@ -575,6 +582,8 @@ public:
+     FScriptDelegate __OnReceivedMOTDData__Delegate;
+     FScriptDelegate __OnReceivedModMOTDData__Delegate;
+     FScriptDelegate __OnReceivedOwnageItem__Delegate;
++    // 3374-only reflected state, stored after the 3369 native delegate layout.
++    TArrayNoInit<PTRINT> ClosedMSLinks;
+     DECLARE_FUNCTION(execLaunchAutoUpdate);
+     DECLARE_FUNCTION(execStop);
+     DECLARE_FUNCTION(execStartQuery);
+diff --git a/IpDrv/Src/IpDrv.cpp b/IpDrv/Src/IpDrv.cpp
+index b7c2118..c3a77cc 100644
+--- a/IpDrv/Src/IpDrv.cpp
++++ b/IpDrv/Src/IpDrv.cpp
+@@ -8,6 +8,65 @@ Revision history:
+ 
+ #include "UnIpDrv.h"
+ 
++#if PLATFORM_32BITS
++#define IPDRV_LAYOUT_FIELD(Class,Member) \
++	{ TEXT(#Member), STRUCT_OFFSET(Class,Member), sizeof(((Class*)0)->Member), 0, 0, 0 }
++#define IPDRV_LAYOUT_BOOL(Name,Offset,Mask) \
++	{ TEXT(Name), Offset, sizeof(BITFIELD), 0, Mask, 1 }
++
++static FNativePropertyLayout GMasterServerLinkNativeProperties[] =
++{
++	IPDRV_LAYOUT_FIELD(AMasterServerLink,myMasterServer),
++	IPDRV_LAYOUT_FIELD(AMasterServerLink,MasterServerGroup),
++	IPDRV_LAYOUT_FIELD(AMasterServerLink,MS_Status)
++};
++static FNativeStructLayout GMasterServerLinkNativeLayout =
++{
++	TEXT("IpDrv"), NULL, TEXT("MasterServerLink"), sizeof(AMasterServerLink),
++	GMasterServerLinkNativeProperties,
++	sizeof(GMasterServerLinkNativeProperties)/sizeof(GMasterServerLinkNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GServerQueryClientNativeProperties[] =
++{
++	IPDRV_LAYOUT_FIELD(AServerQueryClient,lastMasterServerIndex),
++	IPDRV_LAYOUT_FIELD(AServerQueryClient,PrivateResolveInfo),
++	IPDRV_LAYOUT_BOOL("bLANQuery",sizeof(AMasterServerLink),((BITFIELD)1<<0))
++};
++static FNativeStructLayout GServerQueryClientNativeLayout =
++{
++	TEXT("IpDrv"), NULL, TEXT("ServerQueryClient"), sizeof(AServerQueryClient),
++	GServerQueryClientNativeProperties,
++	sizeof(GServerQueryClientNativeProperties)/sizeof(GServerQueryClientNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GMasterServerClientNativeProperties[] =
++{
++	IPDRV_LAYOUT_FIELD(AMasterServerClient,ClosedMSLinks),
++	IPDRV_LAYOUT_FIELD(AMasterServerClient,OwnageLevel)
++};
++static FNativeStructLayout GMasterServerClientNativeLayout =
++{
++	TEXT("IpDrv"), NULL, TEXT("MasterServerClient"), sizeof(AMasterServerClient),
++	GMasterServerClientNativeProperties,
++	sizeof(GMasterServerClientNativeProperties)/sizeof(GMasterServerClientNativeProperties[0]), NULL
++};
++
++struct FRegisterIpDrvNativeLayouts
++{
++	FRegisterIpDrvNativeLayouts()
++	{
++		RegisterNativeStructLayout(&GMasterServerLinkNativeLayout);
++		RegisterNativeStructLayout(&GServerQueryClientNativeLayout);
++		RegisterNativeStructLayout(&GMasterServerClientNativeLayout);
++	}
++};
++static FRegisterIpDrvNativeLayouts GRegisterIpDrvNativeLayouts;
++
++#undef IPDRV_LAYOUT_FIELD
++#undef IPDRV_LAYOUT_BOOL
++#endif
++
+ /*-----------------------------------------------------------------------------
+ 	Declarations.
+ -----------------------------------------------------------------------------*/
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index c0c0c57..01aa535 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -173,6 +173,8 @@ int main(int argc, char** argv)
+         UBOOL AdminReported = 0;
+         INT Frame = 0;
+         DOUBLE Previous = appSeconds();
++        DOUBLE RateStart = Previous;
++        INT RateTicks = 0;
+         if (Interactive) {
+             debugf(NAME_Init, TEXT("WASM: interactive RAF loop ready"));
+             EM_ASM({ Module.interactiveReady = true; Module.interactiveReadyMs = performance.now(); });
+@@ -196,6 +198,13 @@ int main(int argc, char** argv)
+             const DOUBLE Now = appSeconds();
+             Engine->Tick(Interactive ? Clamp<FLOAT>(Now - Previous, 0.001f, 0.1f) : 1.0f / 60.0f);
+             Previous = Now;
++            ++RateTicks;
++            if (Now > RateStart + 1.0)
++            {
++                Engine->CurrentTickRate = (FLOAT)RateTicks / (Now - RateStart);
++                RateStart = Now;
++                RateTicks = 0;
++            }
+             if (Interactive && Engine->Client && Engine->Client->Viewports.Num())
+             {
+                 APlayerController* Player = Engine->Client->Viewports(0)->Actor;
+diff --git a/XInterface/Inc/XInterfaceClasses.h b/XInterface/Inc/XInterfaceClasses.h
+index 4c99e08..35f50e7 100644
+--- a/XInterface/Inc/XInterfaceClasses.h
++++ b/XInterface/Inc/XInterfaceClasses.h
+@@ -359,6 +359,7 @@ public:
+     FStringNoInit EditFavoriteMenu;
+     TArrayNoInit<FString> MainMenuOptions;
+     FStringNoInit DesignerMenu;
++    FStringNoInit CustomMapVotingMenu;
+     BYTE RepeatKey;
+     BITFIELD bIgnoreNextRelease:1 GCC_PACK(4);
+     BITFIELD ShiftPressed:1;
+@@ -2195,6 +2196,7 @@ public:
+     FLOAT MinValue GCC_PACK(4);
+     FLOAT MaxValue;
+     FLOAT Step;
++    INT Decimals;
+     BITFIELD bReadOnly:1 GCC_PACK(4);
+     DECLARE_CLASS(UGUIFloatEdit,UGUIMultiComponent,0,XInterface)
+ 		void PreDraw(UCanvas* Canvas);
+@@ -2238,6 +2240,7 @@ public:
+     class UGUITabButton* PendingTab;
+     class UGUIStyles* BackgroundStyle;
+     class UGUIBorder* MyFooter;
++    FScriptDelegate __OnOpenTab__Delegate;
+     void eventMakeTabActive(class UGUITabButton* Who)
+     {
+         UGUITabControl_eventMakeTabActive_Parms Parms;
+@@ -2915,6 +2918,13 @@ public:
+     FLOAT BorderOffsets[4];
+     FLOAT X3;
+     FLOAT Y3;
++    BITFIELD AspectRatioScale:1 GCC_PACK(4);
++    BYTE ImageReAlign;
++    FLOAT AcL;
++    FLOAT AcT;
++    FLOAT AcW;
++    FLOAT AcH;
++    class UGUIImage* AlignWith;
+     DECLARE_CLASS(UGUIImage,UGUIComponent,0,XInterface)
+ 		void UpdateBounds();
+ 		void Draw(UCanvas* Canvas);
+@@ -3805,6 +3815,8 @@ public:
+     INT FallBackRes;
+     TArrayNoInit<FString> FontArrayNames;
+     TArrayNoInit<class UFont*> FontArrayFonts;
++    INT NormalYRes;
++    INT parm_YRes;
+     DECLARE_FUNCTION(execGetFont);
+     DECLARE_FUNCTION(execGetFontB);
+     class UFont* eventGetFont(INT XRes)
+diff --git a/XInterface/Src/UnGUICore.cpp b/XInterface/Src/UnGUICore.cpp
+index 9e0b4cf..84b26ef 100644
+--- a/XInterface/Src/UnGUICore.cpp
++++ b/XInterface/Src/UnGUICore.cpp
+@@ -1447,6 +1447,7 @@ void UGUIController::execNotifyMenuStatus( FFrame& Stack, RESULT_DECL )
+ 	P_GET_UBOOL(bOpen);
+ 	P_GET_STR_OPTX(MenuName, TEXT(""));
+ 	P_FINISH;
++	Master->Client->bMenuOpen = bOpen;
+ 	unguardexec;
+ }
+ 
+diff --git a/XInterface/Src/XInterface.cpp b/XInterface/Src/XInterface.cpp
+index d8ad2e9..b9ec086 100644
+--- a/XInterface/Src/XInterface.cpp
++++ b/XInterface/Src/XInterface.cpp
+@@ -6,6 +6,98 @@
+ 
+ #include "XInterface.h"
+ 
++#if PLATFORM_32BITS
++#define XINTERFACE_LAYOUT_FIELD(Class,Member) \
++	{ TEXT(#Member), STRUCT_OFFSET(Class,Member), sizeof(((Class*)0)->Member), 0, 0, 0 }
++#define XINTERFACE_LAYOUT_BOOL(Name,Offset,Mask) \
++	{ TEXT(Name), Offset, sizeof(BITFIELD), 0, Mask, 1 }
++
++static FNativePropertyLayout GGUIControllerNativeProperties[] =
++{
++	XINTERFACE_LAYOUT_FIELD(UGUIController,CustomMapVotingMenu),
++	XINTERFACE_LAYOUT_FIELD(UGUIController,RepeatKey)
++};
++static FNativeStructLayout GGUIControllerNativeLayout =
++{
++	TEXT("XInterface"), NULL, TEXT("GUIController"), sizeof(UGUIController),
++	GGUIControllerNativeProperties,
++	sizeof(GGUIControllerNativeProperties)/sizeof(GGUIControllerNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GGUIImageNativeProperties[] =
++{
++	XINTERFACE_LAYOUT_BOOL("AspectRatioScale",INDEX_NONE,((BITFIELD)1<<0)),
++	XINTERFACE_LAYOUT_FIELD(UGUIImage,ImageReAlign),
++	XINTERFACE_LAYOUT_FIELD(UGUIImage,AcL),
++	XINTERFACE_LAYOUT_FIELD(UGUIImage,AcT),
++	XINTERFACE_LAYOUT_FIELD(UGUIImage,AcW),
++	XINTERFACE_LAYOUT_FIELD(UGUIImage,AcH),
++	XINTERFACE_LAYOUT_FIELD(UGUIImage,AlignWith)
++};
++static FNativeStructLayout GGUIImageNativeLayout =
++{
++	TEXT("XInterface"), NULL, TEXT("GUIImage"), sizeof(UGUIImage),
++	GGUIImageNativeProperties,
++	sizeof(GGUIImageNativeProperties)/sizeof(GGUIImageNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GTabControlNativeProperties[] =
++{
++	XINTERFACE_LAYOUT_FIELD(UGUITabControl,__OnOpenTab__Delegate)
++};
++static FNativeStructLayout GTabControlNativeLayout =
++{
++	TEXT("XInterface"), NULL, TEXT("GUITabControl"), sizeof(UGUITabControl),
++	GTabControlNativeProperties,
++	sizeof(GTabControlNativeProperties)/sizeof(GTabControlNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GGUIFontNativeProperties[] =
++{
++	XINTERFACE_LAYOUT_FIELD(UGUIFont,FallBackRes),
++	XINTERFACE_LAYOUT_FIELD(UGUIFont,FontArrayNames),
++	XINTERFACE_LAYOUT_FIELD(UGUIFont,FontArrayFonts),
++	XINTERFACE_LAYOUT_FIELD(UGUIFont,NormalXRes),
++	XINTERFACE_LAYOUT_FIELD(UGUIFont,NormalYRes),
++	XINTERFACE_LAYOUT_FIELD(UGUIFont,parm_YRes)
++};
++static FNativeStructLayout GGUIFontNativeLayout =
++{
++	TEXT("XInterface"), NULL, TEXT("GUIFont"), sizeof(UGUIFont),
++	GGUIFontNativeProperties,
++	sizeof(GGUIFontNativeProperties)/sizeof(GGUIFontNativeProperties[0]), NULL
++};
++
++static FNativePropertyLayout GGUIFloatEditNativeProperties[] =
++{
++	XINTERFACE_LAYOUT_FIELD(UGUIFloatEdit,Decimals),
++	XINTERFACE_LAYOUT_BOOL("bReadOnly",
++		STRUCT_OFFSET(UGUIFloatEdit,Step)+sizeof(FLOAT)+sizeof(INT),((BITFIELD)1<<0))
++};
++static FNativeStructLayout GGUIFloatEditNativeLayout =
++{
++	TEXT("XInterface"), NULL, TEXT("GUIFloatEdit"), sizeof(UGUIFloatEdit),
++	GGUIFloatEditNativeProperties,
++	sizeof(GGUIFloatEditNativeProperties)/sizeof(GGUIFloatEditNativeProperties[0]), NULL
++};
++
++struct FRegisterXInterfaceNativeLayouts
++{
++	FRegisterXInterfaceNativeLayouts()
++	{
++		RegisterNativeStructLayout(&GGUIControllerNativeLayout);
++		RegisterNativeStructLayout(&GGUIImageNativeLayout);
++		RegisterNativeStructLayout(&GTabControlNativeLayout);
++		RegisterNativeStructLayout(&GGUIFontNativeLayout);
++		RegisterNativeStructLayout(&GGUIFloatEditNativeLayout);
++	}
++};
++static FRegisterXInterfaceNativeLayouts GRegisterXInterfaceNativeLayouts;
++
++#undef XINTERFACE_LAYOUT_FIELD
++#undef XINTERFACE_LAYOUT_BOOL
++#endif
++
+ IMPLEMENT_PACKAGE(XInterface);
+ 
+ #define NAMES_ONLY

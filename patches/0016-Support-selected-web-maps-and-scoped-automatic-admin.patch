@@ -1,0 +1,138 @@
+From a1a6969e2107dd2a8faea603af9e37ad181a7b80 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 17:11:24 -0700
+Subject: [PATCH 16/16] Support selected web maps and scoped automatic
+ administration
+
+---
+ CHANGES-wasm-port.md              | 22 ++++++++++++++++++
+ Engine/Src/UnRenderVisibility.cpp |  9 ++++++++
+ Launch/Src/LaunchEmscripten.cpp   | 37 ++++++++++++++++++++++++++-----
+ 3 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index a41a20a..e480833 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -321,3 +321,25 @@ exit=1
+   joining the persistent server. No server travel or restart is performed.
+ - Exact results, before/after logs, screenshots and cold/warm 640/1280 live-site
+   measurements are in wrapper `build/phase7b/`; see `docs/phase7b-report.md`.
++
++## Phase 8 — selectable maps, 3369 auto-admin, bounded BSP stack
++
++- `Launch/Src/LaunchEmscripten.cpp`: the web launcher takes its local map from
++  the shell's manifest-validated selection and starts selected local maps with
++  two bots. Engine map metadata selects the game mode; multiplayer still opens
++  the existing 3369 relay after boot. Startup uses a fixed character buffer,
++  because engine allocation is not initialized before `appInit`.
++- After a network player and replication info exist, the web launcher issues
++  `adminlogin ut2004` once for that player through the existing viewport console
++  dispatcher. This applies only to `Module.connect` on the exact 3369 relay URL.
++  Replicated admin status is included in existing browser player evidence;
++  grant or timeout is logged once without blocking gameplay. Native platforms,
++  the headless Node probe, and the 3374 server are unchanged.
++- `Engine/Src/UnRenderVisibility.cpp::ProcessNode`: replace the wasm-only tail
++  recursion through BSP coplanar nodes with a loop, preserving node order,
++  visibility, lights and projectors. On chi1 ARM Chromium, Rankin precaching
++  exceeded the host call stack. A diagnostic caught the original
++  `RangeError: Maximum call stack size exceeded` before fatal teardown masked
++  it with `memory access out of bounds`. Native recursion stays unchanged.
++- Browser shell, automated map/admin/travel checks and source/server evidence
++  are maintained in the wrapper repository under `build/phase8/`.
+diff --git a/Engine/Src/UnRenderVisibility.cpp b/Engine/Src/UnRenderVisibility.cpp
+index bb1443d..ee0d79c 100644
+--- a/Engine/Src/UnRenderVisibility.cpp
++++ b/Engine/Src/UnRenderVisibility.cpp
+@@ -1078,6 +1078,10 @@ static FConvexVolume* ExtrudePolygon(FRenderState& RenderState,FPoly& Polygon,UB
+ static void ProcessNode(FRenderState& RenderState,INT iNode,FDynamicLight** DynamicLights,INT NumDynamicLights,FProjectorRenderInfo** DynamicProjectors,INT NumDynamicProjectors)
+ {
+ 	guard(ProcessNode);
++#if defined(__EMSCRIPTEN__)
++	// Coplanar chains can exceed the browser's host stack during precaching.
++	do {
++#endif
+ 
+ 	FBspNode&	Node = RenderState.Model->Nodes(iNode);
+ 	FBspSurf&	Surf = RenderState.Model->Surfs(Node.iSurf);
+@@ -1460,8 +1464,13 @@ static void ProcessNode(FRenderState& RenderState,INT iNode,FDynamicLight** Dyna
+ 		}
+ 	}
+ 
++#if defined(__EMSCRIPTEN__)
++	iNode = Node.iPlane;
++	} while(iNode != INDEX_NONE);
++#else
+ 	if(Node.iPlane != INDEX_NONE)
+ 		ProcessNode(RenderState,Node.iPlane,DynamicLights,NumDynamicLights,DynamicProjectors,NumDynamicProjectors);
++#endif
+ 
+ 	unguard;
+ }
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index ea3f2bb..c1739e5 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -67,9 +67,12 @@ int main(int argc, char** argv)
+ #if defined(UT2004_WEB_CLIENT)
+     const UBOOL Interactive = EM_ASM_INT({ return Module.interactive ? 1 : 0; });
+     const UBOOL Splash = EM_ASM_INT({ return Module.splash ? 1 : 0; });
+-    const TCHAR* CommandLine = Interactive && !Splash
+-        ? TEXT("DM-Rankin?game=XGame.xDeathMatch?NumBots=0 -nohomedir -nosound")
+-        : TEXT("-nohomedir -nosound");
++    char Map[256];
++    EM_ASM({ stringToUTF8(Module.map || 'DM-Rankin', $0, $1); }, Map, sizeof(Map));
++    const UBOOL LocalMap = EM_ASM_INT({ return Module.localMap ? 1 : 0; });
++    char BrowserCommandLine[320];
++    snprintf(BrowserCommandLine, sizeof(BrowserCommandLine), "%s?NumBots=%i -nohomedir -nosound", Map, LocalMap ? 2 : 0);
++    const TCHAR* CommandLine = Interactive && !Splash ? BrowserCommandLine : TEXT("-nohomedir -nosound");
+ #else
+     const TCHAR* CommandLine = TEXT("-nohomedir -nosound");
+ #endif
+@@ -135,6 +138,11 @@ int main(int argc, char** argv)
+             Engine->Exec(*FString::Printf(TEXT("open 127.0.0.1?Name=%s"), Name), *GLog);
+         }
+         GIsRunning = 1;
++        // Only the dedicated 3369 relay opts into the shared admin login.
++        const UBOOL AutoAdmin = EM_ASM_INT({ return Module.connect && Module.relayURL === 'wss://games.rgnv.dev/ut2004b/connect2' ? 1 : 0; });
++        APlayerController* AdminPlayer = NULL;
++        DOUBLE AdminSent = 0;
++        UBOOL AdminReported = 0;
+         INT Frame = 0;
+         DOUBLE Previous = appSeconds();
+         if (Interactive) {
+@@ -154,11 +162,28 @@ int main(int argc, char** argv)
+             if (Interactive && Engine->Client && Engine->Client->Viewports.Num())
+             {
+                 APlayerController* Player = Engine->Client->Viewports(0)->Actor;
+-                if (!Player) continue;
++                if (!Player || Player->Level->NetMode != NM_Client) {
++                    AdminPlayer = NULL;
++                    if (!Player) continue;
++                }
++                if (AutoAdmin && Player->Level->NetMode == NM_Client && Player->PlayerReplicationInfo) {
++                    if (AdminPlayer != Player) {
++                        AdminPlayer = Player;
++                        AdminSent = Now;
++                        AdminReported = 0;
++                        Engine->Client->Viewports(0)->Exec(TEXT("adminlogin ut2004"), *GLog);
++                    }
++                    if (!AdminReported && (Player->PlayerReplicationInfo->bAdmin || Now - AdminSent > 10.0)) {
++                        debugf(NAME_Log, Player->PlayerReplicationInfo->bAdmin
++                            ? TEXT("WASM: auto-admin granted") : TEXT("WASM: auto-admin not granted; continuing gameplay"));
++                        AdminReported = 1;
++                    }
++                }
+                 AActor* Target = Player->Pawn ? (AActor*)Player->Pawn : (AActor*)Player;
+-                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7, netMode: $8}); },
++                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7, netMode: $8, admin: !!$9}); },
+                     Frame, Target->Location.X, Target->Location.Y, Target->Location.Z,
+-                    Player->Rotation.Pitch, Player->Rotation.Yaw, Player->Rotation.Roll, Player->Pawn != NULL, Player->Level->NetMode);
++                    Player->Rotation.Pitch, Player->Rotation.Yaw, Player->Rotation.Roll, Player->Pawn != NULL, Player->Level->NetMode,
++                    Player->PlayerReplicationInfo && Player->PlayerReplicationInfo->bAdmin);
+             }
+         }
+         GIsRunning = 0;
+-- 
+2.47.3
+

@@ -1,0 +1,41 @@
+From 32a62ef167f2d66bd4c5301630799b456b3cf98e Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 09:18:20 -0700
+Subject: [PATCH 08/16] Allow wasm socket startup when broadcast option is
+ unsupported
+
+---
+ CHANGES-wasm-port.md       | 1 +
+ IpDrv/Src/TcpNetDriver.cpp | 5 +++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 9fe485b..91f72d9 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -138,3 +138,4 @@ exit=1
+ - `Core/Src/UnObj.cpp`: Emscripten FArchiveTagUsed uses a TArray worklist drained at the outermost reference. RF_Unreachable is still cleared before scheduling, RF_EliminateObject still nulls references, RF_DebugSerialize is checked after serialization, and each queued object/name is traced before root processing returns. Native recursion remains verbatim. Removes the now-obsolete recursive depth probes after capturing them in commit 491b6c6. Both CollectGarbage and IsReferenced use this archive.
+ - Differential regression: recursive archive with Node --stack-size=4096 and worklist archive with default Node stack yield byte-identical pre-purge dumps of 50,971 entries: 20,779 reachable objects, 168 unreachable objects, 29,889 reachable names, 135 unreachable names. Both proceed to the same socket fatal. Captures: `phase2c-recursive-reachability.txt`, `phase2c-worklist-reachability.txt`, `phase2c-gc-comparison.txt`, plus boot logs; temporary audit removed.
+ - Saved 2000-frame path contains 1955 Next edges, 17 Children, 10 SuperField, one Class, and 16 other references. Example valid crossings: Actor.MessageClass → LocalMessage; GameInfo.VehicleList → Vehicle → Pawn; Pawn.LastHitBy → Controller; LevelInfo.ReplicationViewer → PlayerController. Object/class property serializers and script references connect the independently valid sibling lists. Loader ULinkerLoad::operator<< resolves stored package indices via IndexToObject; UField/UStruct deserialize Next/Children directly. No loader correction is justified.
++- `IpDrv/Src/TcpNetDriver.cpp`, UTcpNetDriver::InitBase (shared by InitConnect/InitListen): Emscripten-only SO_BROADCAST failure now warns and continues without setting Error; native fatal behavior unchanged. Uses `%s` for SocketError(), which returns TCHAR*: the previous displayed numbers (68850/68888) were string addresses, not errno values. No UDP/broadcast functionality is claimed.
+diff --git a/IpDrv/Src/TcpNetDriver.cpp b/IpDrv/Src/TcpNetDriver.cpp
+index ee6d6c2..ca76e81 100644
+--- a/IpDrv/Src/TcpNetDriver.cpp
++++ b/IpDrv/Src/TcpNetDriver.cpp
+@@ -373,8 +373,13 @@ UBOOL UTcpNetDriver::InitBase( UBOOL Connect, FNetworkNotify* InNotify, FURL& UR
+ 	UBOOL TrueBuffer=1;
+ 	if( setsockopt( Socket, SOL_SOCKET, SO_BROADCAST, (char*)&TrueBuffer, sizeof(TrueBuffer) ) )
+ 	{
++#if defined(__EMSCRIPTEN__)
++		// The socket shim lacks broadcast; local map startup can still proceed.
++		debugf( NAME_Warning, TEXT("WASM: setsockopt SO_BROADCAST unsupported (%s); continuing without broadcast"), SocketError() );
++#else
+ 		Error = FString::Printf( TEXT("%s: setsockopt SO_BROADCAST failed (%i)"), SOCKET_API, SocketError() );
+ 		return 0;
++#endif
+ 	}
+ 	if( !SetSocketReuseAddr( Socket ) )
+ 		debugf(TEXT("setsockopt with SO_REUSEADDR failed"));
+-- 
+2.47.3
+

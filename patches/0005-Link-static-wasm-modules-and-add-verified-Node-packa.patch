@@ -1,0 +1,394 @@
+From eceea6fd8a244c38aeeb2df8ab6d045c35cf74a9 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 08:42:45 -0700
+Subject: [PATCH 05/16] Link static wasm modules and add verified Node
+ package-mount boot
+
+---
+ CHANGES-wasm-port.md             | 61 ++++++++++++++++++++
+ Core/Src/UnClass.cpp             |  5 ++
+ Core/Src/UnObj.cpp               |  4 ++
+ Core/Src/UnUnix.cpp              | 31 +++++++++++
+ IpDrv/Src/MasterServerUplink.cpp |  4 ++
+ Launch/Src/LaunchEmscripten.cpp  | 95 ++++++++++++++++++++++++++++++++
+ Launch/Src/wasm-registry.py      | 33 +++++++++++
+ 7 files changed, 233 insertions(+)
+ create mode 100644 Launch/Src/LaunchEmscripten.cpp
+ create mode 100644 Launch/Src/wasm-registry.py
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index a967819..7edffa0 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -64,3 +64,64 @@ Core validation: all 20 objects rebuilt successfully. `llvm-nm --undefined-only
+ - `IpDrv/Src/UnSocket.cpp`: resolver values `TRY_AGAIN`/`NO_RECOVERY` overlap WASI errno values; diagnostic switch retains errno interpretations.
+ 
+ No linking, browser execution or native build attempted; this phase establishes object compilation only.
++
++## Phase 2 — static link and Node boot (2026-10-13)
++
++### Entry and link recipe
++
++- Workspace `link-em.sh` is committed in the **parent workspace repository**, on its own `wasm-port` branch; this source repository is nested and has a separate `wasm-port` history. The recipe builds its own objects in `build/wasm/obj`, tracks source/header/recipe freshness, fails on compile/link errors, retains wasm function names, and produces `build/ut2004.js` plus `.wasm`. It does not depend on phase-1 objects or modify `build-em.sh`.
++- SDK pinned to the cached Emscripten 6.0.12 image digest `sha256:77638e6c215a65f25a704c0c831d5c2463a8c0468a58c6cb82489dbe621dfa05`. Uses memory growth, 8 MiB stack, Node raw filesystem, exit runtime, assertions, and the brief's multiple-definition allowance. Undefined symbols remain errors.
++- Core, Engine (including built-in NullDrv), and IpDrv linked. SDLDrv, OpenGLDrv, original Launch/Helper, and UCC editor/extra game modules excluded. First unresolved symbols were supplied by **existing** `KConstraint.cpp`, `KScript.cpp`, `KPhysic.cpp`, `KSkeletal.cpp`, `xForceFeedback.cpp`, `TcpNetDriver.cpp`, `MasterServerUplink.cpp`, and `HTTPDownload.cpp`; no fake physics/network exports added. An exploratory build compiled all K*.cpp files. The isolated build caught initially omitted KPhysic/KSkeletal definitions (AKActor vtable/Spawned, execCalcContactRegion, execGraphData, execKScaleJointLimits), now explicitly included. Remaining empty Karma objects are excluded; failure evidence: `build/logs/link-isolated-missing-karma.log`.
++- zlib: initial link used SDK `USE_ZLIB`; final recipe compiles the 15 in-tree C sources. `Core/Inc/FFileManagerGeneric.h` explicitly includes `../../zlib/zlib.h` (1.3.1), so final library matches these headers and requires no SDK port download. The zlib compile sets its existing `Z_HAVE_UNISTD_H` configuration macro after the standalone build exposed undeclared `lseek` in gzlib.c; no zlib source changes.
++- `Launch/Src/LaunchEmscripten.cpp`: new `__EMSCRIPTEN__`-guarded console probe, modeled on UCC's `appInit` rather than Windows launch/window/CD/UI code. Changes cwd to `/opt/ut2004/System`, uses ANSI allocator/error/feedback, Unix file manager and stdout log. Dedicated-server flags and `-nohomedir -nosound`; no viewport or network session started by the probe.
++- Probe default attempts full Core/Engine object loading, configured game engine construction/`Init`, and three synchronous fixed-delta ticks. Those later steps are **not reached** with the installed packages. `--mount-only` instead reads real package summaries, names/imports/exports with `GetPackageLinker(LOAD_NoVerify)` inside BeginLoad/EndLoad, explicitly labels this as tables-only, then runs `appPreExit`/`appExit`. This mode does not claim import verification, object loading, or engine initialization.
++- Probe re-enables Init/DevLoad messages suppressed by installed config, checks static registry known/missing exports/modules, marks cached configs `NoSave` before normal shutdown, and rejects unknown CLI arguments with exit 2. Stdout logger uses existing `FName::SafeString` so logging after name subsystem shutdown remains valid.
++
++### Source fixes and iteration evidence
++
++- `IpDrv/Src/MasterServerUplink.cpp`, `SendStatLine`: omit illegal in-class extra qualification only for Emscripten. Exposed when adding the missing implementation to the link.
++- `Launch/Src/wasm-registry.py`: derives per-module `autoclass*` and `int*exec*` export tables from **defined symbols in actual objects**, with exact `UClass*`/`Native` declarations. Asserts each module has objects/exports. Generated C++ is guarded and remains under build/. Classes and native functions use existing C++ static constructors; registry returns their export addresses, not invented init functions.
++- `Core/Src/UnUnix.cpp`, `appGetDllHandle`/`appGetDllExport`/`appFreeDllHandle`: Emscripten-only path/basename/extension normalization and static Core/Engine/IpDrv lookup; unknown modules/exports return null; static handles are never dlclosed. Native dlopen behavior unchanged. Initial boot logged `dlerror(): dynamic linking not enabled`; registry removes those errors.
++- `Core/Src/UnUnix.cpp`, `appCycles`/`appPlatformInit`: Emscripten microsecond counter backed by existing `appSecondsSlow`; `GSecondsPerCycle=0.000001`, CPU calibration/override omitted. Initial boot failed `Please specify CPUSPEED=x on cmdline.` No fabricated CPU frequency supplied.
++- `Core/Src/UnUnix.cpp`, file descriptor limits: skip unsupported getrlimit/setrlimit block on Emscripten after Node warned `unsupported syscall: __syscall_prlimit64`; native block untouched.
++- `Core/Src/UnObj.cpp`, `InitProperties`: guarded runtime check of default-copy bounds, even with DO_CHECK=0. Replaces unsigned-size overflow/memory trap with exact class/default/object/base sizes. Diagnostic boot: `WASM defaults size mismatch: class=Core.Object defaults=16 object=16 base=44`.
++- `Core/Src/UnClass.cpp`, `UStruct::Link`: for wasm root UObject only, reserve its existing seven pointer-sized private slots if the first deserialized property is `Outer` rather than `ObjectInternal`. Installed Core.u's embedded Object script has only Outer/ObjectFlags/Name/Class; repository script includes ObjectInternal[7]. Temporary field tracing showed offsets 0/4/8/12; tracing was removed after identifying this discrepancy. Packages already containing ObjectInternal retain original layout calculation. This narrow compatibility fix advances loading to native API mismatch; it is not general support for all newer package layouts.
++- Earlier probe iterations: `build/boot-01.txt` CPU-speed failure; `boot-02.txt`/`boot-03.txt` default-copy trap (symbolized in 03); `boot-04.txt` bounds diagnostic; `boot-05.txt` field offsets; `boot-06.txt` missing RandRange native. `boot-07.txt` exposed stdout logger's post-name-shutdown access, fixed with SafeString. `boot-08.txt` then exposed a post-main allocator lifetime trap (`null function or function signature mismatch` in FArray::Realloc from global UClass destructors). Startup services now have static storage, matching UCC lifetime; success is checked by Node exit code, not only the printed clean-exit marker. Initial unresolved-symbol list retained in `build/logs/link-01.log`.
++
++### Remaining full-boot boundary
++
++The installed `Core.u` declares `native static final function float RandRange(float Min, float Max)`; this source tree's `!_UnrealScript_And_Stuff/Core/Classes/Object.uc` implements it as a script function, and C++ has no `UObject::execRandRange` or corresponding native export. Full load stops with:
++
++```
++Critical: Can't find 'intUObjectexecRandRange' in 'Core.dll'
++```
++
++`Core.dll` is the engine's localization text; the wasm static module is Core, not an attempted Windows DLL load. Resolution requires packages matching this source/native API, or a deliberate implementation of the newer native API and validation of further class layouts. No dummy export or `nobind` bypass added. Engine class init, level loading, and three-frame path remain unvalidated behind this blocker. Browser/GL/network/native-platform validation remains outside this phase.
++
++### Final acceptance and reproduction
++
++Run from `/var/lib/hermes/work/ut2004-web`:
++
++```
++$ ./link-em.sh
++LINK OK: build/ut2004.js + build/ut2004.wasm
++$ node build/ut2004.js --mount-only
++Init: WASM: Core init complete
++Init: WASM: static registry self-check passed
++Init: WASM: mounted ../System/Core.u version=128 names=522 imports=18 exports=871 (tables only)
++Init: WASM: mounted ../System/Engine.u version=128 names=8790 imports=103 exports=15548 (tables only)
++Init: WASM: mounted ../System/IpDrv.u version=128 names=596 imports=79 exports=747 (tables only)
++Exit: Object subsystem successfully closed.
++WASM: clean exit
++exit=0
++$ node build/ut2004.js
++Critical: Can't find 'intUObjectexecRandRange' in 'Core.dll'
++exit=1
++```
++
++- Exact complete transcripts, including both process exit codes: `build/boot-log.txt`. The code above excerpts selected lines; exit codes were captured by the subprocess harness.
++- Standalone rebuild compiled 163 objects without compile/link errors (`build/logs/final-clean-compile.log`); final allocator-lifetime fix rebuilt launcher and generated registry, then linked successfully (`build/logs/link.log`, `build/final-link.txt`). Artifact assertions verified all 163 object headers and final wasm header as WebAssembly v1.
++- `node build/ut2004.js --bad-option` prints usage and exits 2. `bash -n link-em.sh` and source `git diff --check` exit 0. Validation output: `build/final-validation.txt`.
++- `sha256sum -c build/game-data-before.txt` reports `OK` for Core.u, Engine.u, IpDrv.u, UT2004.ini, and User.ini after final boots; tested game data/config bytes unchanged. Package/source API and package hashes recorded in `build/package-api-evidence.txt`.
++- Acceptance achieved at the brief's fallback boundary: **clean link, Core initialization, real package-table mounting, clean Node exit**. Full object loading remains blocked at the precise native API mismatch above; engine initialization/frames are not claimed.
++- Source worktree is committed clean on `wasm-port`. Parent workspace contains pre-existing untracked `PHASE-2-BRIEF.md`, `PORT-BRIEF.md`, `build-em.sh`, `build/`, `codex-final-message.txt`, and nested `src/`; they are preserved rather than deleted, ignored, or swept into the recipe commit. Parent tracked changes consist only of the new link script.
+diff --git a/Core/Src/UnClass.cpp b/Core/Src/UnClass.cpp
+index 26b6ea6..5e0106a 100644
+--- a/Core/Src/UnClass.cpp
++++ b/Core/Src/UnClass.cpp
+@@ -382,6 +382,11 @@ void UStruct::Link( FArchive& Ar, UBOOL Props )
+ 			UProperty* Property = Cast<UProperty>( Field );
+ 			if( Property )
+ 			{
++#if defined(__EMSCRIPTEN__)
++                // Core.u variants starting at Outer omit the native ObjectInternal[7] slots.
++                if (this == UObject::StaticClass() && !Prev && !appStrcmp(Property->GetName(), TEXT("Outer")))
++                    PropertiesSize = 7 * sizeof(PTRINT);
++#endif
+ 				Property->Link( Ar, Prev );
+ 				PropertiesSize = Property->Offset + Property->GetSize();
+ 				Prev = Property;
+diff --git a/Core/Src/UnObj.cpp b/Core/Src/UnObj.cpp
+index 0e77893..25bc224 100644
+--- a/Core/Src/UnObj.cpp
++++ b/Core/Src/UnObj.cpp
+@@ -1985,6 +1985,10 @@ void UObject::InitProperties( BYTE* Data, INT DataCount, UClass* DefaultsClass,
+ 	{
+ 		checkSlow(DefaultsCount>=Inited);
+ 		checkSlow(DefaultsCount<=DataCount);
++#if defined(__EMSCRIPTEN__)
++        if (DefaultsCount < Inited || DefaultsCount > DataCount)
++            appErrorf(TEXT("WASM defaults size mismatch: class=%s defaults=%d object=%d base=%d"), DefaultsClass->GetPathName(), DefaultsCount, DataCount, Inited);
++#endif
+ 		appMemcpy( Data+Inited, Defaults+Inited, DefaultsCount-Inited ); //ALERT
+ 		Inited = DefaultsCount;
+ 	}
+diff --git a/Core/Src/UnUnix.cpp b/Core/Src/UnUnix.cpp
+index 5db8ed7..f0a7a73 100644
+--- a/Core/Src/UnUnix.cpp
++++ b/Core/Src/UnUnix.cpp
+@@ -1288,10 +1288,23 @@ CORE_API void ClipboardPaste( FString& Result )
+ //
+ // Load a library.
+ //
++#if defined(__EMSCRIPTEN__)
++extern void* appWasmModule(const TCHAR* Name);
++extern void* appWasmExport(void* Handle, const TCHAR* Name);
++#endif
+ void* appGetDllHandle( const TCHAR* Filename )
+ {
+ 	guard(appGetDllHandle);
+ 
++#if defined(__EMSCRIPTEN__)
++    const TCHAR* Name = Filename;
++    for (const TCHAR* C = Filename; *C; ++C)
++        if (*C == '/' || *C == '\\') Name = C + 1;
++    FString Module(Name);
++    INT Dot = Module.InStr(TEXT("."));
++    if (Dot != INDEX_NONE) Module = Module.Left(Dot);
++    return appWasmModule(*Module);
++#else
+ 	void *Result = NULL;
+ 
+ 	#if 0 //__STATIC_LINK
+@@ -1392,6 +1405,7 @@ void* appGetDllHandle( const TCHAR* Filename )
+ #endif
+ 
+ 	return Result;
++#endif
+ 	unguard;
+ }
+ 
+@@ -1408,7 +1422,9 @@ void appFreeDllHandle( void* DllHandle )
+ 
+ 	// remember that you can unload bundles,
+ 	//  but not .dylib files on Darwin! --ryan.
++#if !defined(__EMSCRIPTEN__)
+ 	dlclose( DllHandle );
++#endif
+ 
+ 	unguard;
+ }
+@@ -1422,6 +1438,9 @@ void* appGetDllExport( void* DllHandle, const TCHAR* ProcName )
+ 	check(DllHandle);
+ 	check(ProcName);
+ 
++#if defined(__EMSCRIPTEN__)
++    return appWasmExport(DllHandle, ProcName);
++#else
+ 	void* Result = NULL;
+ 
+ 	const char *Error;
+@@ -1434,6 +1453,7 @@ void* appGetDllExport( void* DllHandle, const TCHAR* ProcName )
+ 		debugf( TEXT("dlerror: %s"), ANSI_TO_TCHAR(Error) );
+ 
+ 	return Result;
++#endif
+ 
+ 	unguard;
+ }
+@@ -1716,7 +1736,11 @@ CORE_API DOUBLE appSecondsSlow()
+ #if !DEFINED_appCycles
+ CORE_API DWORD appCycles()
+ {
++#if defined(__EMSCRIPTEN__)
++    return (DWORD)(QWORD)(appSecondsSlow() * 1000000.0);
++#else
+ 	return (DWORD)appSeconds();
++#endif
+ }
+ #endif
+ 
+@@ -2593,6 +2617,9 @@ void appPlatformInit()
+ 		GSecondsPerCycle = 1;
+ 	}
+ 
++#elif defined(__EMSCRIPTEN__)
++    GSecondsPerCycle = 0.000001; // appCycles uses microseconds, not CPU ticks.
++    debugf(NAME_Init, TEXT("WASM timer: microsecond cycles"));
+ #else
+ 	if( !Parse(appCmdLine(),TEXT("CPUSPEED="),CpuSpeed) )
+ 	{
+@@ -2601,12 +2628,14 @@ void appPlatformInit()
+ 	}
+ #endif
+ 
++#if !defined(__EMSCRIPTEN__)
+ 	if( Parse(appCmdLine(),TEXT("CPUSPEED="),CpuSpeed) )
+ 	{
+ 		GSecondsPerCycle = 0.000001/CpuSpeed;
+ 		debugf( NAME_Init, TEXT("CPU Speed Overridden=%f MHz"), 0.000001 / GSecondsPerCycle );
+ 		appStrcat( GMachineCPU, *FString::Printf(TEXT(" @ %d MHz"), appRound(0.000001 / GSecondsPerCycle) ) ); // gam
+ 	}
++#endif
+ 	unguard;
+ 
+ 	struct sigaction SigAction;
+@@ -2674,6 +2703,7 @@ void appPlatformInit()
+ 
+ 	signal( SIGPIPE, SIG_IGN );
+ 
++#if !defined(__EMSCRIPTEN__)
+     // attempt to change max file handles for this process...
+     struct rlimit rl;
+     if (getrlimit(RLIMIT_NOFILE, &rl) != -1)
+@@ -2711,6 +2741,7 @@ void appPlatformInit()
+         }
+     }
+ 
++#endif
+ 	unguard;
+ }
+ 
+diff --git a/IpDrv/Src/MasterServerUplink.cpp b/IpDrv/Src/MasterServerUplink.cpp
+index abdbb76..ab0307f 100644
+--- a/IpDrv/Src/MasterServerUplink.cpp
++++ b/IpDrv/Src/MasterServerUplink.cpp
+@@ -678,7 +678,11 @@ public:
+ 		unguard;
+ 	}
+ 
++	#if defined(__EMSCRIPTEN__)
++	UBOOL SendStatLine( const TCHAR* StatLine )
++	#else
+ 	UBOOL FMasterServerUplinkLink::SendStatLine( const TCHAR* StatLine )
++	#endif
+ 	{
+ 		guard(SendStatLine);
+ 		if( UplinkState == MSUS_ChannelOpen )
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+new file mode 100644
+index 0000000..55ac09d
+--- /dev/null
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -0,0 +1,95 @@
++// Headless Node smoke boot: use the console startup path without UCC's editor modules.
++#if defined(__EMSCRIPTEN__)
++#include "Engine.h"
++#include "UnLinker.h"
++#include "FMallocAnsi.h"
++#include "FFileManagerUnix.h"
++#include "FOutputDeviceAnsiError.h"
++#include "FFeedbackContextAnsi.h"
++#include "FConfigCacheIni.h"
++#include <unistd.h>
++
++INT GFilesOpen, GFilesOpened;
++extern "C" { TCHAR GPackage[] = TEXT("Launch"); }
++
++class FWasmLog : public FOutputDevice
++{
++public:
++    void Serialize(const TCHAR* Text, EName Event)
++    {
++        printf("%s: %s\n", FName::SafeString(Event), Text);
++        fflush(stdout);
++    }
++};
++
++int main(int argc, char** argv)
++{
++    UBOOL MountOnly = 0;
++    if (argc == 2 && !strcmp(argv[1], "--mount-only")) MountOnly = 1;
++    else if (argc != 1)
++    {
++        fprintf(stderr, "Usage: node build/ut2004.js [--mount-only]\n");
++        return 2;
++    }
++    setbuf(stdout, NULL);
++    if (chdir("/opt/ut2004/System") != 0)
++    {
++        perror("chdir /opt/ut2004/System");
++        return 1;
++    }
++    // Global engine destructors still use these services after main returns.
++    static FMallocAnsi Malloc;
++    static FFileManagerUnix Files;
++    static FWasmLog Log;
++    static FOutputDeviceAnsiError Error;
++    static FFeedbackContextAnsi Warn;
++    strcpy(GModule, "ut2004-wasm");
++    GIsStarted = 1;
++    GIsClient = 0;
++    GIsServer = 1;
++    GIsEditor = 0;
++    appInit(TEXT("UT2004"), TEXT("-nohomedir -nosound"), &Malloc, &Log, &Error, &Warn, &Files, FConfigCacheIni::Factory, 1);
++    FName(NAME_Init).ClearFlags(RF_Suppress);
++    FName(NAME_DevLoad).ClearFlags(RF_Suppress);
++    debugf(NAME_Init, TEXT("WASM: Core init complete"));
++    void* CoreModule = appGetDllHandle(TEXT("/opt/ut2004/System/Core.so"));
++    if (!CoreModule || !appGetDllExport(CoreModule, TEXT("autoclassUObject")) ||
++        appGetDllExport(CoreModule, TEXT("missing_export")) || appGetDllHandle(TEXT("missing_module.so")))
++        appErrorf(TEXT("WASM static registry self-check failed"));
++    debugf(NAME_Init, TEXT("WASM: static registry self-check passed"));
++    if (MountOnly)
++    {
++        const TCHAR* Packages[] = { TEXT("Core"), TEXT("Engine"), TEXT("IpDrv") };
++        for (INT I = 0; I < 3; ++I)
++        {
++            UObject::BeginLoad();
++            ULinkerLoad* Linker = UObject::GetPackageLinker(NULL, Packages[I], LOAD_NoFail | LOAD_NoVerify, NULL, NULL);
++            if (!Linker) appErrorf(TEXT("WASM: failed to mount %s"), Packages[I]);
++            debugf(NAME_Init, TEXT("WASM: mounted %s version=%d names=%d imports=%d exports=%d (tables only)"),
++                *Linker->Filename, Linker->Ver(), Linker->NameMap.Num(), Linker->ImportMap.Num(), Linker->ExportMap.Num());
++            UObject::EndLoad();
++        }
++    }
++    else
++    {
++        UObject::LoadPackage(NULL, TEXT("Core"), LOAD_NoFail);
++        debugf(NAME_Init, TEXT("WASM: Core package loaded"));
++        UObject::LoadPackage(NULL, TEXT("Engine"), LOAD_NoFail);
++        debugf(NAME_Init, TEXT("WASM: Engine package loaded"));
++        UClass* EngineClass = UObject::StaticLoadClass(UGameEngine::StaticClass(), NULL,
++            TEXT("ini:Engine.Engine.GameEngine"), NULL, LOAD_NoFail, NULL);
++        UEngine* Engine = ConstructObject<UEngine>(EngineClass);
++        Engine->Init();
++        debugf(NAME_Init, TEXT("WASM: engine initialized"));
++        for (INT Frame = 0; Frame < 3 && !GIsRequestingExit; ++Frame) Engine->Tick(1.0f / 60.0f);
++        debugf(NAME_Init, TEXT("WASM: bounded loop complete"));
++    }
++    // This probe must not rewrite the installed game's configuration on exit.
++    for (FConfigCacheIni::TIterator It(*(FConfigCacheIni*)GConfig); It; ++It) It.Value().NoSave = 1;
++    appPreExit();
++    appExit();
++    GIsStarted = 0;
++    printf("WASM: clean exit\n");
++    return 0;
++}
++#endif
+diff --git a/Launch/Src/wasm-registry.py b/Launch/Src/wasm-registry.py
+new file mode 100644
+index 0000000..73c5915
+--- /dev/null
++++ b/Launch/Src/wasm-registry.py
+@@ -0,0 +1,33 @@
++"""Generate static DLL exports from the actual linked objects, not a hand-kept list."""
++import pathlib
++import re
++import subprocess
++import sys
++
++out = ['#if defined(__EMSCRIPTEN__)', '#include "Core.h"',
++       'struct FWasmExport { const char* Name; void* Address; };']
++modules = []
++for module in ("Core", "Engine", "IpDrv"):
++    objects = sorted(pathlib.Path(sys.argv[1], module.lower()).glob("*.o"))
++    assert objects, module
++    symbols = subprocess.check_output(
++        ["/emsdk/upstream/bin/llvm-nm", "--defined-only", "--format=posix", *map(str, objects)],
++        text=True)
++    names = sorted(set(re.findall(r"^(autoclass\w+|int\w+exec\w+) [BD] ", symbols, re.M)))
++    assert names, module
++    for name in names:
++        kind = "UClass*" if name.startswith("autoclass") else "Native"
++        out.append('extern "C" %s %s;' % (kind, name))
++    out.append('static FWasmExport Exports%s[] = {' % module)
++    out.extend('{"%s", &%s},' % (name, name) for name in names)
++    out.append('{NULL, NULL}};')
++    modules.append(module)
++out += ['void* appWasmModule(const TCHAR* Name) {']
++for module in modules:
++    out.append('if (!appStricmp(Name, TEXT("%s"))) return Exports%s;' % (module, module))
++out += ['return NULL; }',
++        'void* appWasmExport(void* Handle, const TCHAR* Name) {',
++        'for (FWasmExport* E = (FWasmExport*)Handle; E && E->Name; ++E)',
++        'if (!appStrcmp(Name, E->Name)) return E->Address;',
++        'return NULL; }', '#endif']
++pathlib.Path(sys.argv[2]).write_text('\n'.join(out) + '\n')
+-- 
+2.47.3
+

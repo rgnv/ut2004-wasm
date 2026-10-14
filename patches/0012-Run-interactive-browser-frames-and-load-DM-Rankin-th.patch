@@ -1,0 +1,145 @@
+From ed8d1aaa9338779df6056832efa97ceb5abf5f44 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 10:37:43 -0700
+Subject: [PATCH 12/16] Run interactive browser frames and load DM-Rankin
+ through engine startup
+
+---
+ CHANGES-wasm-port.md            | 36 +++++++++++++++++++++++++
+ Launch/Src/LaunchEmscripten.cpp | 48 ++++++++++++++++++++++++++++++---
+ 2 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index d9dfefc..036f2b5 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -221,3 +221,39 @@ exit=1
+   166 wasm objects, saved GC differential and five original data/config hashes.
+   No interactive input/audio, arbitrary maps, native platform build or
+   multiplayer validation claimed.
++
++## Phase 4 — interactive browser client and DM-Rankin (2026-10-13)
++
++- `Launch/Src/LaunchEmscripten.cpp`, inside the existing `__EMSCRIPTEN__` /
++  `UT2004_WEB_CLIENT` guards: interactive startup passes
++  `DM-Rankin?game=XGame.xDeathMatch?NumBots=0` to the existing engine Browse path.
++  The splash diagnostic and default bounded startup retain NvidiaLogo.
++- Interactive ticks await `requestAnimationFrame` through `EM_ASYNC_JS` on the
++  same Asyncify stack as HTTP package reads. Ticks cannot overlap; elapsed delta
++  is clamped to 1–100 ms so a slow/background tab cannot cause a giant step.
++  There is no frame limit. `Module.shutdownRequested` stops at the next RAF and
++  runs the existing NoSave/appPreExit/appExit path. Node keeps three fixed ticks;
++  bounded browser mode keeps six fixed ticks.
++- Ephemeral SDL config enables ungrabbed mouse motion. Existing SDL3 scancode,
++  button and motion routing is used unchanged. Read-only `Module.playerState`
++  reports pawn/controller position and controller rotation for input evidence.
++- Parent `web/index.html` supplies interactive/splash links, focusable canvas,
++  Stop button and `window.__shutdown()`. Readback runs on demand in interactive
++  mode, not every frame; raw PNGs and nonblack counts, mean RGB, maximum channel,
++  color variety and GL errors are captured without image correction.
++- Parent CDP harness injects real key and mouse events. DM-Rankin renders stable
++  geometry/textures, clicking spawns the pawn, W changes its position, and mouse
++  motion changes controller rotation. Before/after PNG SHA-256 values and engine
++  state are retained in parent `build/phase4/input-proof.txt`.
++- Darkness diagnosis: the first splash capture has peak channel 11, the 2-second
++  capture reaches 62, the 10-second capture reaches 255; by 30 seconds the normal
++  menu appears. `USubActionFade::Update` changes `FlashScale.X`; `UnRender.cpp`
++  draws the corresponding alpha overlay. Six fixed ticks captured the fade-in.
++  `UOpenGLRenderDevice::UpdateGamma` still computes the native 256-entry ramp but
++  skips its unsupported SDL3/browser hardware upload. No gamma shim added:
++  unmodified Rankin frames are stable and visible. Desktop gamma/brightness
++  control parity remains unsupported, distinct from the diagnosed early fade.
++- Acceptance evidence and commands live in parent `build/phase4/`; report in
++  `docs/phase4-report.md`. Node regression passes full boot, mount, usage, active
++  GC, historical reachability comparison, 166 wasm objects and original hashes.
++  No websocket transport, multiplayer, audio or native-platform changes.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 21a8546..d17ca49 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -1,4 +1,4 @@
+-// Headless Node smoke boot and bounded browser client, without UCC editor modules.
++// Headless Node smoke boot and browser client, without UCC editor modules.
+ #if defined(__EMSCRIPTEN__)
+ #include "Engine.h"
+ #include "UnLinker.h"
+@@ -12,6 +12,10 @@
+ 
+ #if defined(UT2004_WEB_CLIENT)
+ extern "C" void RegisterNamesXInterface(void);
++// Keep async package reads on one suspended main stack; never overlap engine ticks.
++EM_ASYNC_JS(void, WaitForBrowserFrame, (), {
++    await new Promise(requestAnimationFrame);
++});
+ #endif
+ 
+ INT GFilesOpen, GFilesOpened;
+@@ -60,13 +64,23 @@ int main(int argc, char** argv)
+ #endif
+     GIsServer = 1;
+     GIsEditor = 0;
+-    appInit(TEXT("UT2004"), TEXT("-nohomedir -nosound"), &Malloc, &Log, &Error, &Warn, &Files, FConfigCacheIni::Factory, 1);
++#if defined(UT2004_WEB_CLIENT)
++    const UBOOL Interactive = EM_ASM_INT({ return Module.interactive ? 1 : 0; });
++    const UBOOL Splash = EM_ASM_INT({ return Module.splash ? 1 : 0; });
++    const TCHAR* CommandLine = Interactive && !Splash
++        ? TEXT("DM-Rankin?game=XGame.xDeathMatch?NumBots=0 -nohomedir -nosound")
++        : TEXT("-nohomedir -nosound");
++#else
++    const TCHAR* CommandLine = TEXT("-nohomedir -nosound");
++#endif
++    appInit(TEXT("UT2004"), CommandLine, &Malloc, &Log, &Error, &Warn, &Files, FConfigCacheIni::Factory, 1);
+ #if defined(UT2004_WEB_CLIENT)
+     RegisterNamesXInterface();
+     GIsScriptable = 1;
+     GConfig->SetString(TEXT("Engine.Engine"), TEXT("ViewportManager"), TEXT("SDLDrv.SDLClient"));
+     GConfig->SetString(TEXT("Engine.Engine"), TEXT("RenderDevice"), TEXT("OpenGLDrv.OpenGLRenderDevice"));
+     GConfig->SetBool(TEXT("SDLDrv.SDLClient"), TEXT("StartupFullscreen"), 0);
++    GConfig->SetBool(TEXT("SDLDrv.SDLClient"), TEXT("IgnoreUngrabbedMouse"), 0);
+     GConfig->SetInt(TEXT("SDLDrv.SDLClient"), TEXT("WindowedViewportX"), 640);
+     GConfig->SetInt(TEXT("SDLDrv.SDLClient"), TEXT("WindowedViewportY"), 480);
+ #endif
+@@ -107,11 +121,39 @@ int main(int argc, char** argv)
+ #if defined(UT2004_WEB_CLIENT)
+         GIsRunning = 1;
+         INT Frame = 0;
+-        for (; Frame < 6 && !GIsRequestingExit; ++Frame) Engine->Tick(1.0f / 60.0f);
++        DOUBLE Previous = appSeconds();
++        if (Interactive) {
++            debugf(NAME_Init, TEXT("WASM: interactive RAF loop ready"));
++            EM_ASM({ Module.interactiveReady = true; });
++        }
++        for (; (Interactive || Frame < 6) && !GIsRequestingExit; ++Frame)
++        {
++            if (Interactive)
++            {
++                WaitForBrowserFrame();
++                if (EM_ASM_INT({ return Module.shutdownRequested ? 1 : 0; })) break;
++            }
++            const DOUBLE Now = appSeconds();
++            Engine->Tick(Interactive ? Clamp<FLOAT>(Now - Previous, 0.001f, 0.1f) : 1.0f / 60.0f);
++            Previous = Now;
++            if (Interactive && Engine->Client && Engine->Client->Viewports.Num())
++            {
++                APlayerController* Player = Engine->Client->Viewports(0)->Actor;
++                AActor* Target = Player->Pawn ? (AActor*)Player->Pawn : (AActor*)Player;
++                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7}); },
++                    Frame, Target->Location.X, Target->Location.Y, Target->Location.Z,
++                    Player->Rotation.Pitch, Player->Rotation.Yaw, Player->Rotation.Roll, Player->Pawn != NULL);
++            }
++        }
+         GIsRunning = 0;
+         debugf(NAME_Init, TEXT("WASM: browser ticks=%i"), Frame);
+ #else
+         for (INT Frame = 0; Frame < 3 && !GIsRequestingExit; ++Frame) Engine->Tick(1.0f / 60.0f);
++#endif
++#if defined(UT2004_WEB_CLIENT)
++        if (Interactive)
++            debugf(NAME_Init, TEXT("WASM: interactive loop stopped"));
++        else
+ #endif
+         if (emscripten_run_script_int("typeof window !== 'undefined' || typeof importScripts === 'function'"))
+             debugf(NAME_Init, TEXT("WASM: browser bounded loop complete"));
+-- 
+2.47.3
+

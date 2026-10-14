@@ -1,0 +1,529 @@
+From 96e0e41c61657689efb87f703a0ae9a261618810 Mon Sep 17 00:00:00 2001
+From: hermes <hermes@localhost>
+Date: Wed, 14 Oct 2026 01:00:20 -0700
+Subject: [PATCH 19/21] Link ALAudio through Emscripten WebAudio OpenAL and
+ stream Vorbis music
+
+Compile ALAudio plus the vendored Ogg/Vorbis decoder into the browser target
+and bind OpenAL against the SDK's WebAudio-backed libopenal; no openal-soft
+fallback and no entry-point shims were needed.
+
+Adapt the module to a single-threaded Asyncify runtime: decode Ogg chunks on
+the main thread instead of a background pthread, drain every processed stream
+buffer per tick, deepen the Emscripten stream queue, resolve the ALFuncs table
+against the linked library instead of a DLL handle, disable the voice capture
+device (which would open a second AudioContext and call getUserMedia), and keep
+queued transient USounds alive across the LoadMap collection.
+
+Expose the real AudioContext, an analyser tap and audioDebug counters to the
+browser shell, and let the interactive web client run with sound (the bounded,
+splash and Node paths keep -nosound).
+---
+ ALAudio/Inc/ALAudioStream.h       |   7 ++
+ ALAudio/Src/ALAudioCapture.cpp    |   4 +
+ ALAudio/Src/ALAudioStream.cpp     |  23 +++-
+ ALAudio/Src/ALAudioSubsystem.cpp  | 177 +++++++++++++++++++++++++++++-
+ CHANGES-wasm-port.md              |  60 ++++++++++
+ Launch/Src/LaunchEmscripten.cpp   |  13 ++-
+ Vorbis/ogg/include/ogg/os_types.h |  10 ++
+ 7 files changed, 289 insertions(+), 5 deletions(-)
+
+diff --git a/ALAudio/Inc/ALAudioStream.h b/ALAudio/Inc/ALAudioStream.h
+index fc6d5b4..bcd5c79 100644
+--- a/ALAudio/Inc/ALAudioStream.h
++++ b/ALAudio/Inc/ALAudioStream.h
+@@ -15,7 +15,14 @@ Revision history:
+ ------------------------------------------------------------------------------------*/
+ 
+ #define MAX_STREAM_CHUNKSIZE 65536
++#if defined(__EMSCRIPTEN__)
++// The browser build decodes Ogg chunks on the main thread, whose ticks can
++// stall for seconds (package fetches, Asyncify suspension, GC). Hold ~3 s of
++// audio so one stalled tick cannot starve the WebAudio queue.
++#define STREAM_NUMCHUNKS 8
++#else
+ #define STREAM_NUMCHUNKS 4
++#endif
+ 
+ struct	OggVorbis_File;
+ 
+diff --git a/ALAudio/Src/ALAudioCapture.cpp b/ALAudio/Src/ALAudioCapture.cpp
+index f77b7fc..01d30ef 100644
+--- a/ALAudio/Src/ALAudioCapture.cpp
++++ b/ALAudio/Src/ALAudioCapture.cpp
+@@ -70,6 +70,10 @@ FALAudioCaptureDevice::~FALAudioCaptureDevice()
+ //
+ UBOOL FALAudioCaptureDevice::Init()
+ {
++#if defined(__EMSCRIPTEN__)
++	debugf(NAME_Init, TEXT("ALAudio: voice capture disabled on Emscripten."));
++	return 0;
++#endif
+ 	// Favor ALC_EXT_capture...
+ 	if( UALAudioSubsystem::SUPPORTS_ALC_EXT_capture )
+ 	{
+diff --git a/ALAudio/Src/ALAudioStream.cpp b/ALAudio/Src/ALAudioStream.cpp
+index 9344ea9..b4c0d72 100644
+--- a/ALAudio/Src/ALAudioStream.cpp
++++ b/ALAudio/Src/ALAudioStream.cpp
+@@ -118,6 +118,10 @@ UBOOL FALAudioStream::QueryStream( INT& ChunksQueued )
+ {
+ 	FScopeCriticalSection Lock( CriticalSection );
+ 
++#if defined(__EMSCRIPTEN__)
++	if( ChunksRequested > 0 )
++		ReadChunks( ChunksRequested );
++#endif
+ 	ChunksQueued = ChunksRequested;
+ 	return !EndOfFile;
+ }
+@@ -529,7 +533,9 @@ void FALAudioStreamManager::Init()
+    _ogg_set_vector_unit(GIsAltivec);
+ #endif
+ 
+-#if __UNIX__
++#if defined(__EMSCRIPTEN__)
++	// Single-threaded Asyncify build decodes Ogg stream chunks on the main thread.
++#elif __UNIX__
+ 	pthread_t FileStreamingThreadId = 0;
+ 	int rc = pthread_create(&FileStreamingThreadId, NULL,
+ 	                        FileStreamingThread, this);
+@@ -551,6 +557,20 @@ void FALAudioStreamManager::Init()
+ void FALAudioStreamManager::Destroy()
+ {
+ 	guard(FALAudioStreamManager::Destroy);
++#if defined(__EMSCRIPTEN__)
++	if( Destroyed == 0 )
++	{
++		FALAudioStream* Stream = First;
++		while( Stream )
++		{
++			FALAudioStream* Dummy = Stream->GetNext();
++			delete Stream;
++			Stream = Dummy;
++		}
++		First = Last = NULL;
++		Destroyed = 2;
++	}
++#else
+ 	if( Destroyed == 0 )
+ 	{
+ 		Destroyed = 1;
+@@ -561,6 +581,7 @@ void FALAudioStreamManager::Destroy()
+ 		ASI_shutdown();
+ #endif
+ 	}
++#endif
+ 	unguard;
+ }
+ 
+diff --git a/ALAudio/Src/ALAudioSubsystem.cpp b/ALAudio/Src/ALAudioSubsystem.cpp
+index c16e247..605fdb7 100644
+--- a/ALAudio/Src/ALAudioSubsystem.cpp
++++ b/ALAudio/Src/ALAudioSubsystem.cpp
+@@ -40,6 +40,36 @@ Revision history:
+ #undef AL_PROC
+ #undef ALC_PROC
+ #endif
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++static INT WasmAudioSoundsStarted = 0;
++static INT WasmAudioBuffersProcessed = 0;
++static INT WasmAudioLastError = 0;
++extern "C" {
++#define AL_EXT(name)
++#define ALC_EXT(name)
++#define AL_PROC(ext,ret,func,parms) ret CDECL func parms;
++#define ALC_PROC(ext,ret,func,parms) ret CDECL func parms;
++#include "ALFuncs.h"
++#undef AL_EXT
++#undef ALC_EXT
++#undef AL_PROC
++#undef ALC_PROC
++}
++static void* appGetOpenALProc(const char* Name)
++{
++#define AL_EXT(name)
++#define ALC_EXT(name)
++#define AL_PROC(ext,ret,func,parms) if (!strcmp(Name, #func)) return (void*)&::func;
++#define ALC_PROC(ext,ret,func,parms) if (!strcmp(Name, #func)) return (void*)&::func;
++#include "ALFuncs.h"
++#undef AL_EXT
++#undef ALC_EXT
++#undef AL_PROC
++#undef ALC_PROC
++	return NULL;
++}
++#endif
+ 
+ #if SUPPORTS_EAX
+ // The below two headers are not standard EAX SDK headers!
+@@ -179,6 +209,20 @@ void UALAudioSubsystem::Shutdown()
+ 		alcMakeContextCurrent( NULL );
+ 		alcDestroyContext( SoundContext );
+ 		alcCloseDevice( SoundDevice );
++#if defined(__EMSCRIPTEN__)
++		EM_ASM({
++			if (Module.audioDebug) {
++				Module.audioDebug.deviceOpen = false;
++				Module.audioDebug.musicPlaying = false;
++				Module.audioDebug.queued = 0;
++				Module.audioDebug.rms = 0;
++			}
++			if (Module.audioContext && Module.audioContext.state !== 'closed') {
++				try { Module.audioContext.close().catch(() => {}); } catch (_) {}
++			}
++			if (Module.audioDebug) Module.audioDebug.contextState = 'closed';
++		});
++#endif
+ 
+ 		SetViewport(NULL);
+ 
+@@ -238,6 +282,11 @@ void UALAudioSubsystem::Serialize( FArchive& Ar )
+ 			Ar << Sources(i)->Sound;
+ 		for( INT i=0; i<Buffers.Num(); i++ )
+ 			Ar << Buffers(i)->Sound;
++#if defined(__EMSCRIPTEN__)
++		for( INT i=0; i<QueuedSources.Num(); i++ )
++			if( QueuedSources(i) )
++				Ar << QueuedSources(i)->Sound;
++#endif
+ 	}
+ 
+ 	unguard;
+@@ -261,6 +310,9 @@ UBOOL UALAudioSubsystem::Init()
+ #if DYNAMIC_BIND
+ 	guard(DynamicBinding);
+ 	// Find DLL's.
++#if defined(__EMSCRIPTEN__)
++	DLLHandle = (void*)-1;
++#else
+ 	DLLHandle = NULL;
+ 	if( !UseDefaultDriver )
+ 	{
+@@ -277,6 +329,7 @@ UBOOL UALAudioSubsystem::Init()
+ 			return 0;
+ 		}
+ 	}
++#endif
+ 	
+ 	// Find functions.
+ 	SUPPORTS_AL = 1;
+@@ -468,6 +521,33 @@ UBOOL UALAudioSubsystem::Init()
+ 	USound::Audio	= this;
+ 
+ 	debugf(NAME_Init,TEXT("ALAudio: subsystem initialized."));
++#if defined(__EMSCRIPTEN__)
++	UsePrecache = 0;
++	WasmAudioSoundsStarted = 0;
++	WasmAudioBuffersProcessed = 0;
++	WasmAudioLastError = 0;
++	EM_ASM({
++		const ctx = typeof AL !== 'undefined' && AL.currentCtx ? AL.currentCtx.audioCtx : null;
++		if (ctx) {
++			Module.audioContext = ctx;
++			if (AL.currentCtx.gain && !AL.currentCtx.analyser) {
++				try {
++					const analyser = ctx.createAnalyser();
++					analyser.fftSize = 1024;
++					AL.currentCtx.gain.connect(analyser);
++					AL.currentCtx.analyser = analyser;
++					AL.currentCtx.rmsData = new Float32Array(analyser.fftSize);
++				} catch (_) {}
++			}
++			if (Module.onAudioContextCreated) Module.onAudioContextCreated(ctx);
++		}
++		if (Module.audioDebug) {
++			Module.audioDebug.deviceOpen = true;
++			Module.audioDebug.contextState = ctx ? ctx.state : 'closed';
++			Module.audioDebug.lastError = 0;
++		}
++	});
++#endif
+ 	return 1;
+ 
+ 	unguard;
+@@ -628,6 +708,12 @@ void UALAudioSubsystem::PlaySound( FSoundSource* InSource )
+ 		else
+ 			alSourceQueueBuffers( sid, Buffer->BufferIds.Num(), &Buffer->BufferIds(0) );
+ 		Source->Play();
++#if defined(__EMSCRIPTEN__)
++		++WasmAudioSoundsStarted;
++		EM_ASM({
++			if (Module.audioDebug) Module.audioDebug.soundsStarted = $0;
++		}, WasmAudioSoundsStarted);
++#endif
+ 	}
+ 
+ 	alError( TEXT("PlaySound END") );
+@@ -660,6 +746,12 @@ UBOOL UALAudioSubsystem::Update( FSceneNode* SceneNode )
+ 
+ 	clock(GStats.DWORDStats(AudioStats.STATS_UpdateCycles));
+ 
++#if defined(__EMSCRIPTEN__)
++	EM_ASM({
++		if (typeof AL !== 'undefined' && AL.currentCtx)
++			AL.scheduleContextAudio(AL.currentCtx);
++	});
++#endif
+ 	// Update.
+ 	if( !UAudioSubsystem::Update( SceneNode ) )
+ 	{
+@@ -713,6 +805,52 @@ UBOOL UALAudioSubsystem::Update( FSceneNode* SceneNode )
+ #endif
+ 	}
+ 
++#if defined(__EMSCRIPTEN__)
++	INT MusicPlaying = 0, QueuedBuffers = 0, PendingProcessed = 0;
++	for( INT i=0; i<Sources.Num(); i++ )
++	{
++		FALSoundSource* Src = Sources(i);
++		if( Src && Src->Initialized && (Src->Flags & SF_Streaming) && Src->Buffer && Src->Buffer->AudioStream )
++		{
++			ALint State = 0, Queued = 0, Proc = 0;
++			alGetSourcei( Src->SourceId, AL_SOURCE_STATE, &State );
++			alGetSourcei( Src->SourceId, AL_BUFFERS_QUEUED, &Queued );
++			alGetSourcei( Src->SourceId, AL_BUFFERS_PROCESSED, &Proc );
++			if( State == AL_PLAYING || Src->IsPlaying() )
++				MusicPlaying = 1;
++			QueuedBuffers += Queued;
++			PendingProcessed += Proc;
++		}
++	}
++	ALint Err = alGetError();
++	if( Err != AL_NO_ERROR )
++	{
++		WasmAudioLastError = Err;
++		debugf(NAME_Warning, TEXT("ALAudio: OpenAL error %i during Update"), (INT)Err);
++	}
++	EM_ASM({
++		if (Module.audioDebug) {
++			const ctx = Module.audioContext;
++			Module.audioDebug.contextState = ctx ? ctx.state : 'closed';
++			Module.audioDebug.musicPlaying = !!$0;
++			Module.audioDebug.queued = $1;
++			Module.audioDebug.processed = $2;
++			Module.audioDebug.soundsStarted = $3;
++			Module.audioDebug.lastError = $4;
++			if (typeof AL !== 'undefined' && AL.currentCtx && AL.currentCtx.analyser && ctx && ctx.state === 'running') {
++				const data = AL.currentCtx.rmsData;
++				AL.currentCtx.analyser.getFloatTimeDomainData(data);
++				let sum = 0;
++				for (let i = 0; i < data.length; ++i) sum += data[i] * data[i];
++				const rms = Math.sqrt(sum / data.length);
++				Module.audioDebug.rms = rms;
++				if (rms > (Module.audioDebug.peakRms || 0)) Module.audioDebug.peakRms = rms;
++			} else {
++				Module.audioDebug.rms = 0;
++			}
++		}
++	}, MusicPlaying, QueuedBuffers, WasmAudioBuffersProcessed + PendingProcessed, WasmAudioSoundsStarted, WasmAudioLastError);
++#endif
+ 	unclock(GStats.DWORDStats(AudioStats.STATS_UpdateCycles));
+ 	return 1;
+ 
+@@ -1212,7 +1350,10 @@ void UALAudioSubsystem::FindProc( void*& ProcAddress, char* Name, char* SupportN
+ // !!! FIXME:  retrieve via alGetProcAddress (or alcGetProcAddress), since
+ // !!! FIXME:  they reserve the right to give different values in certain
+ // !!! FIXME:  cases.  --ryan.
+-#if DYNAMIC_BIND
++#if defined(__EMSCRIPTEN__)
++	if( !ProcAddress )
++		ProcAddress = appGetOpenALProc( Name );
++#elif DYNAMIC_BIND
+ 	if( !ProcAddress )
+ 		ProcAddress = appGetDllExport( DLLHandle, appFromAnsi(Name) );
+ #endif
+@@ -1444,6 +1585,12 @@ UBOOL UALAudioSubsystem::alError( TCHAR* Text, UBOOL Log )
+ 	{
+ 		do 
+ 		{		
++#if defined(__EMSCRIPTEN__)
++			WasmAudioLastError = Error;
++			EM_ASM({
++				if (Module.audioDebug) Module.audioDebug.lastError = $0;
++			}, WasmAudioLastError);
++#endif
+ 			if ( Log )
+ 			{
+ 				switch ( Error )
+@@ -1567,6 +1714,33 @@ UBOOL FALSoundSource::Update( FLOAT DeltaTime )
+ 		UBOOL Alive = Buffer->AudioStream->QueryStream( BuffersInFlight );
+ 
+ 		// Queue incoming packet, space permitting.
++#if defined(__EMSCRIPTEN__)
++		if( BuffersProcessed && !BuffersInFlight )
++		{
++			while( BuffersProcessed > 0 && !BuffersInFlight )
++			{
++				INT& BufferQueueIndex	= Buffer->BufferQueueIndex;
++				INT& BufferUnqueueIndex = Buffer->BufferUnqueueIndex;
++
++				UALAudioSubsystem::alSourceUnqueueBuffers( SourceId, 1, &Buffer->BufferIds(BufferUnqueueIndex) );
++				UALAudioSubsystem::alBufferData( Buffer->BufferIds(BufferQueueIndex), Buffer->AudioStream->GetFormat(), Buffer->AudioStreamData, Buffer->AudioStream->GetChunkSize(), Buffer->AudioStream->GetRate() );
++				UALAudioSubsystem::alSourceQueueBuffers( SourceId, 1, &Buffer->BufferIds(BufferQueueIndex) );
++				++WasmAudioBuffersProcessed;
++
++				Buffer->AudioStream->RequestChunks( 1, Buffer->AudioStreamData );
++
++				++BufferQueueIndex	 %= Buffer->BufferIds.Num();
++				++BufferUnqueueIndex %= Buffer->BufferIds.Num();
++				--BuffersProcessed;
++				if( BuffersProcessed > 0 )
++					Alive = Buffer->AudioStream->QueryStream( BuffersInFlight );
++			}
++
++			// Start playing again.
++			if( SourceState == AL_STOPPED )
++				Play();
++		}
++#else
+ 		if( BuffersProcessed && !BuffersInFlight )
+ 		{
+ 			INT& BufferQueueIndex	= Buffer->BufferQueueIndex;
+@@ -1586,6 +1760,7 @@ UBOOL FALSoundSource::Update( FLOAT DeltaTime )
+ 			if( SourceState == AL_STOPPED )
+ 				Play();
+ 		}
++#endif
+ 		else 
+ 		if( !Alive )
+ 		{
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index f3926b1..3a6d0d5 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -389,3 +389,63 @@ exit=1
+ - Wrapper sources: `web/mobile/mobile-input.{js,css}`, `web/index.html`.
+   Verification: wrapper `scripts/test-mobile-kit.cjs`, `scripts/test-mobile1.cjs`,
+   and `scripts/test-web.cjs --interactive`; evidence in `build/mobile1/`.
++
++## Phase 10 — full game audio (OpenAL/WebAudio + Vorbis music)
++
++- `ALAudio` is linked into the browser target through Emscripten 6.0.12's own
++  WebAudio-backed `libopenal.js`/`libopenal.a`; no openal-soft fallback was
++  needed. The vendored Ogg/Vorbis decoder (`Vorbis/ogg/src/{bitwise,framing}.c`
++  and the `Vorbis/vorbis/lib` decoder set plus `vorbisfile.c`) compiles alongside
++  it. Wrapper `link-web.sh` adds those sources, `-IALAudio/Inc -IOpenAL/Inc
++  -IVorbis/{ogg,vorbis}/include`, `-lopenal`, and passes `ALAudio:alaudio` to
++  `wasm-registry.py`; header freshness now covers `ALAudio OpenAL Vorbis`.
++- `Launch/Src/LaunchEmscripten.cpp` registers the module and self-checks
++  `autoclassUALAudioSubsystem` before any package load, matching the Fire check.
++  It also forces `ALAudio.ALAudioSubsystem.UsePrecache=0` for the browser, because
++  `UALAudioSubsystem::SetViewport` would otherwise decode and upload every
++  `USound` during viewport setup, inside boot.
++- `Vorbis/ogg/include/ogg/os_types.h` gains an `__EMSCRIPTEN__` branch using
++  `<stdint.h>` typedefs, because CMake normally generates `ogg/config_types.h`
++  and this recipe compiles the sources directly. Native branches unchanged.
++- `ALAudio/Src/ALAudioCapture.cpp`: `FALAudioCaptureDevice::Init()` returns 0 on
++  Emscripten and logs it. `alcCaptureOpenDevice` would otherwise open a second
++  `AudioContext` and call `getUserMedia`; voice is out of scope (`WITH_SPEEX 0`).
++- `ALAudio/Src/ALAudioStream.cpp`: the native build decodes Ogg on a background
++  `pthread` and uploads chunks from the main thread. Emscripten has none, so
++  `FALAudioStreamManager::Init` does not create one, `Destroy` frees the stream
++  list synchronously, and `FALAudioStream::QueryStream` decodes the requested
++  chunk inline (it already runs between ticks, where Asyncify file reads are
++  legal). `FALSoundSource::Update` drains *every* processed buffer per tick
++  instead of one, so a stalled tick can still refill the queue.
++- `ALAudio/Inc/ALAudioStream.h`: `STREAM_NUMCHUNKS` 4 → 8 under `__EMSCRIPTEN__`
++  (~3 s of buffered audio) for the same reason.
++- `ALAudio/Src/ALAudioSubsystem.cpp`: with the library linked statically there is
++  no DLL to open, and `alGetProcAddress` refuses to resolve before a context
++  exists. `FindProc` therefore resolves the `ALFuncs.h` table directly against
++  the linked `libopenal` symbols under `__EMSCRIPTEN__`, using the
++  `DLLHandle = (void*)-1` sentinel that `appFreeDllHandle` already ignores for the
++  other statically-linked modules. No entry point needed a shim.
++- Same file adds the browser observability the shell and tests need: a shared
++  counter of started sounds and requeued stream buffers, `alGetError()` sampled
++  once per `UALAudioSubsystem::Update` (logging any non-zero result instead of
++  swallowing it), `alcProcessContext` replaced by an explicit
++  `AL.scheduleContextAudio` call so source state advances within the frame, the
++  OpenAL `AudioContext` published as `Module.audioContext` with an `AnalyserNode`
++  tapped onto the OpenAL master gain, and `Module.audioDebug` filled with
++  `deviceOpen/contextState/musicPlaying/queued/processed/soundsStarted/lastError/rms`.
++- Same file extends `UALAudioSubsystem::Serialize` to keep the transient
++  `QueuedSources` sounds alive across the `CollectGarbage` in `LoadMap`: a track
++  queued by `PlayMusic` during load was otherwise collectable before its first
++  tick. Native builds keep the original set.
++- Wrapper `web/index.html`: the interactive client no longer passes `-nosound`
++  (`?nosound=1` opts out; the bounded/splash probes and the Node build keep it).
++  The shell resumes the real `AudioContext` on the first `pointerdown`/`keydown`,
++  re-issuing `resume()` inside the activation window because a `resume()` issued
++  from the very first `pointerdown` can precede Chrome latching that gesture's
++  transient activation and is not retried by the browser; it suspends while
++  `document.hidden` and resumes on return, and shows "Click to enable sound" in
++  `#status` until the context runs. `Module.audioContext` is the first hook the
++  shared mobile kit already tries, so `web/mobile/mobile-input.js` is unchanged.
++- Verification: wrapper `scripts/test-phase10.cjs` (`ab`, `desktop`, `touch` modes)
++  plus `node scripts/test-phase9.cjs` against the same build; evidence, raw
++  numbers and the diagnostic scripts are in wrapper `build/phase10/`.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 2c7bcf6..26781c0 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -75,12 +75,15 @@ int main(int argc, char** argv)
+ #if defined(UT2004_WEB_CLIENT)
+     const UBOOL Interactive = EM_ASM_INT({ return Module.interactive ? 1 : 0; });
+     const UBOOL Splash = EM_ASM_INT({ return Module.splash ? 1 : 0; });
++    const UBOOL NoSound = EM_ASM_INT({ return Module.noSound ? 1 : 0; });
+     char Map[256];
+     EM_ASM({ stringToUTF8(Module.map || 'DM-Rankin', $0, $1); }, Map, sizeof(Map));
+     const UBOOL LocalMap = EM_ASM_INT({ return Module.localMap ? 1 : 0; });
+     char BrowserCommandLine[320];
+-    snprintf(BrowserCommandLine, sizeof(BrowserCommandLine), "%s?NumBots=%i -nohomedir -nosound", Map, LocalMap ? 2 : 0);
+-    const TCHAR* CommandLine = Interactive && !Splash ? BrowserCommandLine : TEXT("-nohomedir -nosound");
++    snprintf(BrowserCommandLine, sizeof(BrowserCommandLine), "%s?NumBots=%i -nohomedir%s",
++        Map, LocalMap ? 2 : 0, NoSound ? " -nosound" : "");
++    const TCHAR* CommandLine = Interactive && !Splash ? BrowserCommandLine
++        : (Interactive && !NoSound ? TEXT("-nohomedir") : TEXT("-nohomedir -nosound"));
+ #else
+     const TCHAR* CommandLine = TEXT("-nohomedir -nosound");
+ #endif
+@@ -94,6 +97,7 @@ int main(int argc, char** argv)
+     GConfig->SetBool(TEXT("SDLDrv.SDLClient"), TEXT("IgnoreUngrabbedMouse"), 0);
+     GConfig->SetInt(TEXT("SDLDrv.SDLClient"), TEXT("WindowedViewportX"), 640);
+     GConfig->SetInt(TEXT("SDLDrv.SDLClient"), TEXT("WindowedViewportY"), 480);
++    GConfig->SetBool(TEXT("ALAudio.ALAudioSubsystem"), TEXT("UsePrecache"), 0);
+ #endif
+     FName(NAME_Init).ClearFlags(RF_Suppress);
+     FName(NAME_DevLoad).ClearFlags(RF_Suppress);
+@@ -113,6 +117,9 @@ int main(int argc, char** argv)
+     for (INT I = 0; I < 7; ++I)
+         if (!FireModule || !appGetDllExport(FireModule, FireExports[I]))
+             appErrorf(TEXT("WASM Fire registry self-check failed: %s"), FireExports[I]);
++    void* ALAudioModule = appGetDllHandle(TEXT("ALAudio.so"));
++    if (!ALAudioModule || !appGetDllExport(ALAudioModule, TEXT("autoclassUALAudioSubsystem")))
++        appErrorf(TEXT("WASM ALAudio registry self-check failed"));
+ #endif
+     debugf(NAME_Init, TEXT("WASM: static registry self-check passed"));
+     if (MountOnly)
+@@ -155,7 +162,7 @@ int main(int argc, char** argv)
+         DOUBLE Previous = appSeconds();
+         if (Interactive) {
+             debugf(NAME_Init, TEXT("WASM: interactive RAF loop ready"));
+-            EM_ASM({ Module.interactiveReady = true; });
++            EM_ASM({ Module.interactiveReady = true; Module.interactiveReadyMs = performance.now(); });
+         }
+         for (; (Interactive || Frame < 6) && !GIsRequestingExit; ++Frame)
+         {
+diff --git a/Vorbis/ogg/include/ogg/os_types.h b/Vorbis/ogg/include/ogg/os_types.h
+index e655a1d..c10c8db 100644
+--- a/Vorbis/ogg/include/ogg/os_types.h
++++ b/Vorbis/ogg/include/ogg/os_types.h
+@@ -149,6 +149,16 @@
+    typedef long long int ogg_int64_t;
+    typedef unsigned long long int ogg_uint64_t;
+ 
++#elif defined(__EMSCRIPTEN__)
++
++#  include <stdint.h>
++   typedef int16_t ogg_int16_t;
++   typedef uint16_t ogg_uint16_t;
++   typedef int32_t ogg_int32_t;
++   typedef uint32_t ogg_uint32_t;
++   typedef int64_t ogg_int64_t;
++   typedef uint64_t ogg_uint64_t;
++
+ #else
+ 
+ #  include <ogg/config_types.h>

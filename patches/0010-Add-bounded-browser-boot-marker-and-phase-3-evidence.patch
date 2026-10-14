@@ -1,0 +1,89 @@
+From 39884f9b7fa5788b54e2facf03086db3d6415fca Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 09:47:13 -0700
+Subject: [PATCH 10/16] Add bounded browser boot marker and phase 3 evidence
+ record
+
+---
+ CHANGES-wasm-port.md            | 37 +++++++++++++++++++++++++++++++++
+ Launch/Src/LaunchEmscripten.cpp |  8 +++++--
+ 2 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 221bf17..a612d70 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -151,3 +151,40 @@ exit=1
+ - Final command: `env -u WASM_SKIP_GC UT2004_BASE="$PWD/data3369/UT2004/System" node build/ut2004.js`. Transcript `build/logs/phase2c-final.log` records GC `21115->20947`, `Bringing Level NvidiaLogo.myLevel up for play`, `WASM: engine initialized`, `WASM: bounded loop complete`, `WASM: clean exit`, exit 0. Initial successful UWeb run is `phase2c-uweb-linked.log`. UWeb registration accounts for the changed object totals compared with the earlier differential test.
+ - Mount mode exits 0; invalid CLI option exits 2; full boot exits 0. Core.u, Engine.u, Ipdrv.u, UT2004.ini and User.ini hashes unchanged from the pre-fix snapshot. Both git diff --check checks pass. All temporary GC audit instrumentation removed; env-gated skip retained, unused in acceptance.
+ - Known nonfatal messages: absent Editor.TransBuffer in this headless build; unsupported SO_REUSEADDR. No browser/rendering, actual multiplayer traffic, native build/run, or arbitrary-map validation claimed. The synchronous three-tick Node probe is not a networking acceptance test.
++
++## Phase 3 — browser shell (2026-10-13)
++
++- `Launch/Src/LaunchEmscripten.cpp`: retain the same appInit, dedicated-server
++  flags, package/map load, active GC, three fixed-delta ticks and shutdown.
++  Inside the existing `__EMSCRIPTEN__` guard, distinguish browser/worker runtime
++  and emit `WASM: browser bounded loop complete`; Node keeps its original marker.
++- Parent `link-web.sh` links independently into `build/web/`, with its own
++  `build/web-obj` objects, `ENVIRONMENT=web,worker`, MEMFS and no NODERAWFS.
++  `web/pre.js` creates lazy HTTP files for the complete directory manifest and
++  sets UT2004_BASE to `/opt/ut2004/System`. A dedicated worker permits synchronous
++  LazyFile XHR while leaving the page responsive. Game bytes are neither bundled
++  nor edited; writes are ephemeral browser memory.
++- Parent `scripts/serve-web.py` serves loopback HTTP single byte ranges. Stock
++  `python -m http.server` also booted successfully, but transferred whole asset
++  packages for small reads. Range-enabled acceptance transfers 258,471,277 body
++  bytes, including a four-byte range self-check; engine reports ~22.9 MiB read.
++  Emscripten's one-MiB fetch chunks account for the extra traffic.
++- Parent `scripts/test-web.cjs` drives transient Chromium directly through CDP,
++  captures console, HTTP transcript, canvas pixel and screenshot, checks all boot
++  markers and exit 0, then closes browser/server and removes its profile.
++  Browser.close plus asynchronous removal retries avoid a shutdown/profile-write
++  race found during validation. Evidence is in parent `build/phase3a/`.
++- Node regression rebuilt with unchanged `link-em.sh`: full boot, package-table
++  mount, usage rejection, 166 wasm objects, historical GC differential and data
++  checksums all pass (`build/logs/phase3-node-regression.log`).
++- Milestone 3a is headless: no viewport, GL context, interactive loop, audio or
++  multiplayer acceptance. Canvas readback is `[0,0,0,0]`, explicitly labeled.
++  GL4ES stretch work is isolated in the parent probe; no speculative renderer
++  source changes enter the accepted boot target. See parent docs/phase3-report.md
++  for exact GL requirements, measured stretch result and next blocker.
++- Stretch evidence: pinned GL4ES compiles and renders a fixed-function triangle
++  with pixel `[63,64,128,255]`, GL error 0, and all 336 mandatory browser-platform
++  lookups resolved. Bundled SDL3 also compiles, but its video initialization in
++  the 3a-style plain worker throws `ReferenceError: window is not defined` from
++  its system-theme Window access. Engine rendering remains deferred pending
++  main-thread dispatch/context ownership; no map-rendering claim.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 6d3685f..5d3b432 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -1,4 +1,4 @@
+-// Headless Node smoke boot: use the console startup path without UCC's editor modules.
++// Headless Node/browser smoke boot: use the console startup path without UCC's editor modules.
+ #if defined(__EMSCRIPTEN__)
+ #include "Engine.h"
+ #include "UnLinker.h"
+@@ -8,6 +8,7 @@
+ #include "FFeedbackContextAnsi.h"
+ #include "FConfigCacheIni.h"
+ #include <unistd.h>
++#include <emscripten.h>
+ 
+ INT GFilesOpen, GFilesOpened;
+ extern "C" { TCHAR GPackage[] = TEXT("Launch"); }
+@@ -87,7 +88,10 @@ int main(int argc, char** argv)
+         Engine->Init();
+         debugf(NAME_Init, TEXT("WASM: engine initialized"));
+         for (INT Frame = 0; Frame < 3 && !GIsRequestingExit; ++Frame) Engine->Tick(1.0f / 60.0f);
+-        debugf(NAME_Init, TEXT("WASM: bounded loop complete"));
++        if (emscripten_run_script_int("typeof window !== 'undefined' || typeof importScripts === 'function'"))
++            debugf(NAME_Init, TEXT("WASM: browser bounded loop complete"));
++        else
++            debugf(NAME_Init, TEXT("WASM: bounded loop complete"));
+     }
+     // This probe must not rewrite the installed game's configuration on exit.
+     for (FConfigCacheIni::TIterator It(*(FConfigCacheIni*)GConfig); It; ++It) It.Value().NoSave = 1;
+-- 
+2.47.3
+

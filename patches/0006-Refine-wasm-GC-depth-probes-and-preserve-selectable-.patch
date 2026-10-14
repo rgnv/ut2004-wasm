@@ -1,0 +1,109 @@
+From 491b6c65e57a4e4e6da797719210fb8b9a3bc3f0 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 09:14:02 -0700
+Subject: [PATCH 06/16] Refine wasm GC depth probes and preserve selectable
+ boot data
+
+---
+ CHANGES-wasm-port.md            |  8 ++++++++
+ Core/Src/UnObj.cpp              | 25 +++++++++++++++++++++++++
+ Launch/Src/LaunchEmscripten.cpp | 11 ++++++++---
+ 3 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 7edffa0..9e5cf0c 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -125,3 +125,11 @@ exit=1
+ - `sha256sum -c build/game-data-before.txt` reports `OK` for Core.u, Engine.u, IpDrv.u, UT2004.ini, and User.ini after final boots; tested game data/config bytes unchanged. Package/source API and package hashes recorded in `build/package-api-evidence.txt`.
+ - Acceptance achieved at the brief's fallback boundary: **clean link, Core initialization, real package-table mounting, clean Node exit**. Full object loading remains blocked at the precise native API mismatch above; engine initialization/frames are not claimed.
+ - Source worktree is committed clean on `wasm-port`. Parent workspace contains pre-existing untracked `PHASE-2-BRIEF.md`, `PORT-BRIEF.md`, `build-em.sh`, `build/`, `codex-final-message.txt`, and nested `src/`; they are preserved rather than deleted, ignored, or swept into the recipe commit. Parent tracked changes consist only of the new link script.
++
++## Phase 2c — headless GC and socket investigation
++
++- Adopt the incoming `Launch/Src/LaunchEmscripten.cpp` UT2004_BASE override and `Core/Src/UnObj.cpp` env-gated WASM_SKIP_GC diagnostic bypass; GC remains enabled by default. Matching installed data uses `data3369/UT2004/System`, not the extraction root.
++- Refine incoming FArchiveTagUsed depth instrumentation: Emscripten-only high-water reports at 1000 through 9000, then multiples of 25000. Remove the noisy total-visits report and guard all counters; native behavior remains unchanged.
++- Baseline command: `env -u WASM_SKIP_GC UT2004_BASE="$PWD/data3369/UT2004/System" node build/ut2004.js`; transcript `build/logs/phase2c-baseline-system.log` reproduces `RangeError: Maximum call stack size exceeded` at the first map GC. Initial extraction-root attempt (`phase2c-baseline.log`) fails MissingIni.
++- Parent recipe incoming changes enable C++ exceptions and use a 256 MiB linear-memory stack. These are distinct from Node/V8's native call-stack limit; diagnosis will measure actual GC depth.
++- First depth probe (`phase2c-gc-depth.log`) reaches depth 2000, not 50000. Corrected the incoming diagnostic's invalid `*GetFullName()` dereference: GetFullName returns TCHAR*, so ANSI conversion needs the pointer. Empty names were a probe bug, not evidence of corrupted object names.
+diff --git a/Core/Src/UnObj.cpp b/Core/Src/UnObj.cpp
+index 25bc224..7b0ebef 100644
+--- a/Core/Src/UnObj.cpp
++++ b/Core/Src/UnObj.cpp
+@@ -4996,9 +4996,27 @@ private:
+ 			if( Obj->GetFlags() & RF_TagGarbage )
+ 			{
+ 				// Recurse down the object graph.
++#if defined(__EMSCRIPTEN__)
++				static INT GTagDepth = 0;
++				static INT GTagMaxDepth = 0;
++				static long long GTagVisits = 0;
++				++GTagDepth; ++GTagVisits;
++				if( GTagDepth > GTagMaxDepth )
++				{
++					GTagMaxDepth = GTagDepth;
++					if( (GTagDepth < 10000 && GTagDepth % 1000 == 0) || GTagDepth % 25000 == 0 )
++					{
++						fprintf(stderr, "[gc] depth=%d visits=%lld obj=%s\n", GTagDepth, GTagVisits, TCHAR_TO_ANSI(Obj->GetFullName()));
++						fflush(stderr);
++					}
++				}
++#endif
+ 				UObject* OriginalContext = Context;
+ 				Context = Obj;
+ 				Obj->Serialize( *this );
++#if defined(__EMSCRIPTEN__)
++				--GTagDepth;
++#endif
+ 				if( !(Obj->GetFlags() & RF_DebugSerialize) )
+ 					appErrorf( TEXT("%s failed to route Serialize"), Obj->GetFullName() );
+ 				Context = OriginalContext;
+@@ -5306,6 +5324,13 @@ void UObject::CollectGarbage( DWORD KeepFlags )
+ {
+ 	guard(UObject::CollectGarbage);
+ 	debugf( NAME_Log, TEXT("Collecting garbage") );
++#if defined(__EMSCRIPTEN__)
++	if( getenv("WASM_SKIP_GC") )
++	{
++		debugf( NAME_Log, TEXT("WASM: GC skipped (WASM_SKIP_GC set)") );
++		return;
++	}
++#endif
+ 
+ 	// Tag and purge garbage.
+ 	FArchiveTagUsed TagUsedAr;
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 55ac09d..6d3685f 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -32,11 +32,14 @@ int main(int argc, char** argv)
+         return 2;
+     }
+     setbuf(stdout, NULL);
+-    if (chdir("/opt/ut2004/System") != 0)
++    const char* BaseEnv = getenv("UT2004_BASE");
++    if (!BaseEnv) BaseEnv = "/opt/ut2004/System";
++    if (chdir(BaseEnv) != 0)
+     {
+-        perror("chdir /opt/ut2004/System");
++        perror("chdir UT2004_BASE");
+         return 1;
+     }
++    debugf(NAME_Init, TEXT("WASM: base dir %s"), (TCHAR*)BaseEnv);
+     // Global engine destructors still use these services after main returns.
+     static FMallocAnsi Malloc;
+     static FFileManagerUnix Files;
+@@ -52,7 +55,9 @@ int main(int argc, char** argv)
+     FName(NAME_Init).ClearFlags(RF_Suppress);
+     FName(NAME_DevLoad).ClearFlags(RF_Suppress);
+     debugf(NAME_Init, TEXT("WASM: Core init complete"));
+-    void* CoreModule = appGetDllHandle(TEXT("/opt/ut2004/System/Core.so"));
++    char CorePath[512];
++    snprintf(CorePath, sizeof(CorePath), "%s/Core.so", BaseEnv);
++    void* CoreModule = appGetDllHandle((TCHAR*)CorePath);
+     if (!CoreModule || !appGetDllExport(CoreModule, TEXT("autoclassUObject")) ||
+         appGetDllExport(CoreModule, TEXT("missing_export")) || appGetDllHandle(TEXT("missing_module.so")))
+         appErrorf(TEXT("WASM static registry self-check failed"));
+-- 
+2.47.3
+

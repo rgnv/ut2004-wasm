@@ -1,0 +1,1315 @@
+From 4e3e6fe0b41f89da1a236440fbae64fee79670f3 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Wed, 14 Oct 2026 02:02:14 -0700
+Subject: [PATCH 20/21] Phase 12: implement the 3374 native surface
+
+Enumerate the complete 3374 native gap offline (49 entries) and implement all of
+it: Core RandRange/FloatToFormattedString/IsUTracing/SetUTracing/GetModName/
+AllPackageFiles, Engine UObjectPool plus 18 Actor/Pawn/Projectile/LevelInfo/
+GameInfo functions, IpDrv NetworkConnect and MasterServerClientLauncher,
+XInterface NotifyMenuStatus/GetFontB, and the Onslaught native classes.
+
+Add WASM_VERIFY_NATIVES so a missing export, native class constructor or
+unregistered iNative logs and continues instead of aborting at the first one.
+
+3369 data still boots to clean exit; 3374 now binds every native and stops later
+at package/C++ property-layout drift (57 native classes), documented in
+CHANGES-wasm-port.md.
+---
+ CHANGES-wasm-port.md               | 104 +++++++
+ Core/Inc/UnObjBas.h                |   6 +
+ Core/Src/UnClass.cpp               |  16 +
+ Core/Src/UnCorSc.cpp               | 117 +++++++
+ Core/Src/UnCoreNative.cpp          |   6 +
+ Core/Src/UnObj.cpp                 |  20 ++
+ Engine/Inc/EngineClasses.h         |  75 +++++
+ Engine/Src/UnScript.cpp            | 471 +++++++++++++++++++++++++++++
+ IpDrv/Inc/IpDrvClasses.h           |  28 ++
+ IpDrv/Src/MasterServerClient.cpp   |  10 +
+ IpDrv/Src/MasterServerUplink.cpp   |   7 +
+ Launch/Src/LaunchEmscripten.cpp    |  19 +-
+ Onslaught/Src/ONSWheeledCraft.cpp  |   2 +-
+ Onslaught/Src/Onslaught.cpp        |   2 +-
+ XInterface/Inc/XInterfaceClasses.h |   6 +
+ XInterface/Src/UnGUICore.cpp       |  22 ++
+ 16 files changed, 906 insertions(+), 5 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 3a6d0d5..9621006 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -449,3 +449,107 @@ exit=1
+ - Verification: wrapper `scripts/test-phase10.cjs` (`ab`, `desktop`, `touch` modes)
+   plus `node scripts/test-phase9.cjs` against the same build; evidence, raw
+   numbers and the diagnostic scripts are in wrapper `build/phase10/`.
++
++## Phase 12 — 3374 native surface (2026-10-14)
++
++The live dedicated server runs OldUnreal's 3374 Linux patch; 3369-era data boots
++this engine but 3374 data aborted at the first unbound native
++(`Can't find 'intUObjectexecRandRange' in 'Core.dll'`). This phase enumerates the
++**complete** 3374 native surface offline, implements it in the engine source, and
++makes binding failures diagnosable instead of fatal-at-first.
++
++### Enumeration (evidence: wrapper `build/phase12/`)
++
++- Offline diff: every 3374 `.u` export table is decoded and compared against the
++  generated static registry (`Launch/Src/wasm-registry.py` output). Tool: the
++  package decoder used for this phase; results in `missing-natives.txt`
++  (49 entries: 6 Core natives, 1 Engine class + 18 Engine functions, 2 IpDrv
++  classes + 2 functions, 2 XInterface functions, 16 Onslaught classes + 1
++  function) with, for each, the package export index, the owning class, iNative,
++  the exact UnrealScript signature, and the binary address / helper used to
++  reconstruct behaviour.
++- Runtime cross-check: `WASM_VERIFY_NATIVES=1` makes binding log-and-continue and
++  sweeps the whole package set, so the runtime list can be compared against the
++  offline list. Log before the fixes: `verify-natives-before.log`.
++
++### Diagnostics
++
++- `Core/Src/UnObj.cpp` (`UPackage::GetDllExport`): under `__EMSCRIPTEN__`, when
++  `WASM_VERIFY_NATIVES` is truthy, a missing module/export is logged as a warning
++  instead of `appErrorf`. Default behaviour (env unset) is byte-for-byte the
++  original fatal path.
++- `Core/Src/UnClass.cpp`, `UClass::Bind` / `UFunction::Bind`: same gate for a
++  missing `autoclass*` constructor and for a dynamic native whose `GNatives`
++  slot is still `execUndefined` (i.e. an `iNative` the engine never registered).
++- `Launch/Src/LaunchEmscripten.cpp`: with `WASM_VERIFY_NATIVES` set, loads the
++  package set (`IpDrv`, `UWeb`, `Onslaught`, plus `Fire`/`XGame`/`XInterface`)
++  after Engine so their natives are exercised before the map load.
++
++### Implemented natives (all regular implementations, no `#if __EMSCRIPTEN__`)
++
++Reconstructed from the 3374 package signatures, the shipped `.so` disassembly,
++the engine's own helpers, and the public OldUnreal source lineage (no unofficial
++mirrors). Behaviour notes per family:
++
++- `Core/Object.uc`: `RandRange` (`Min + (Max-Min)*appFrand()`, matching the
++  `FRange::GetRand` convention), `FloatToFormattedString` (`%%.%df` with the
++  default `Decimals=2` the binary uses), `IsUTracing`/`SetUTracing` (engine-local
++  trace flag plus the reset semantics of `UObject::UTrace`),
++  `GetModName` (returns `GModName`), `AllPackageFiles` (iNative 198; iterator over
++  the engine's package path list, deduplicated, honouring the optional `FileExt`
++  and `Prefix` filters).
++- `Engine/ObjectPool` (new native class): `AllocateObject` reuses a pooled object
++  of the requested class else constructs a transient one, `FreeObject` returns an
++  object to the pool, `Shrink` empties it. The pool is a transient `UObject`.
++- `Engine/Actor.uc`: `HurtRadius` (radius query through the collision hash, line
++  check, distance-scaled `TakeDamage`, `bHurtEntry` re-entrancy guard, vehicle
++  `DriverRadiusDamage` passthrough), `TriggerEvent`/`UntriggerEvent`
++  (`Tag`-matched `Trigger`/`UnTrigger` broadcast), `AllControllers` (iNative 325;
++  walks `Level.ControllerList` with a class filter), `KRagdollExists` (no-Karma
++  build answers `false`), `ClearAttachedDecals` (`FProjectorRenderInfo::
++  RemoveReference` over `Projectors`), `DrawDebugBox` (`GTempLineBatcher`).
++- `Engine/Pawn.uc`: `AllInventory` (iNative 326; walks the inventory chain with a
++  class filter and a cycle guard, matching the binary's iterator counter).
++- `Engine/Projectile.uc`: `HurtRadius` (same shape as `AActor`'s plus the
++  `LastTouched` follow-up pass, `HurtWall` exclusion, delayed-damage instigator
++  forwarding and vehicle passthrough).
++- `Engine/LevelInfo.uc`: `GetLocalPlayerController` (cached, then local
++  viewport, then controller list — no global engine pointer dependency).
++- `Engine/GameInfo.uc`: `MakeColorCode`, `StripColor` and `FromINIFormat`
++  implemented against the same colour-code convention as the shipped
++  `FString::CreateColorCode`/`StripColorCodes`/`FromINIFormat`
++  (leading `0x1B`, channels clamped to a minimum of 1, `(#RRGGBB)` → code);
++  `GetCurrentTickRate`/`GetConfiguredTickRate` read the engine tick rate and the
++  net driver's `NetServerMaxTickRate`.
++- `IpDrv`: `AMasterServerUplink::NetworkConnect` (creates and connects
++  `FMasterServerUplinkLink` exactly as the shipped `execReconnect` does),
++  `AMasterServerClientLauncher` native class + `SetResultCount`.
++- `XInterface`: `UGUIController::NotifyMenuStatus` (accepted no-op hook with the
++  shipped argument list), `UGUIFont::GetFontB` (sets `parm_YRes` from the
++  property system, then forwards to `GetFont`).
++- `Onslaught`: the 16 native classes the package declares are compiled from the
++  in-tree sources; `AONSWheeledCraft::IMPLEMENT_CLASS` is re-enabled (its
++  on-disk registration was commented out).
++
++Module list: the Node link now covers Core, Engine, IpDrv, UWeb, Onslaught, Fire,
++XGame and XInterface; `Onslaught/Src/Onslaught.cpp` registers its names from the
++launcher under Emscripten instead of a pre-runtime global constructor.
++
++### Result
++
++- **3369 regression stays green**: `env -u WASM_SKIP_GC UT2004_BASE=$PWD/data3369/UT2004/System
++  node build/ut2004.js` reaches `Unreal engine initialized` → `bounded loop
++  complete` → `WASM: clean exit`, exit 0 (log: wrapper
++  `build/phase12/node-3369-final.log`).
++- **3374 still does not boot**: the native-binding failures are gone (XGame,
++  Fire and XInterface natives now resolve), and the client now reaches
++  `UnrealGame.u` class linking before failing with
++  `RuntimeError: null function or function signature mismatch` inside
++  `UStruct::Link`. Root cause is *not* a missing native: the 3374 packages
++  declare native-class property chains that the C++ headers do not mirror
++  (e.g. `Engine.Actor` gains `NetInitialCache` and `RotationRemainder`), and
++  `UStruct::Link(Ar, 1)` derives property offsets from the package's own
++  `Children` order, so every C++ member after the first insertion drifts.
++  57 native classes drift between 3369 and 3374; the full list is
++  `build/phase12/3374-native-class-layout-drift.txt`. This is the remaining
++  blocker and it is a layout port, not a native-by-native port.
+diff --git a/Core/Inc/UnObjBas.h b/Core/Inc/UnObjBas.h
+index 12ca2c9..3bbc864 100644
+--- a/Core/Inc/UnObjBas.h
++++ b/Core/Inc/UnObjBas.h
+@@ -1179,6 +1179,12 @@ public:
+ 	DECLARE_FUNCTION(execHighNative14)
+ 	DECLARE_FUNCTION(execHighNative15)
+ 	DECLARE_FUNCTION(execGetReferencers)
++	DECLARE_FUNCTION(execRandRange)
++	DECLARE_FUNCTION(execFloatToFormattedString)
++	DECLARE_FUNCTION(execIsUTracing)
++	DECLARE_FUNCTION(execSetUTracing)
++	DECLARE_FUNCTION(execGetModName)
++	DECLARE_FUNCTION(execAllPackageFiles)
+ 
+ 	// UnrealScript calling stubs.
+     void eventBeginState()
+diff --git a/Core/Src/UnClass.cpp b/Core/Src/UnClass.cpp
+index 5e0106a..11c2072 100644
+--- a/Core/Src/UnClass.cpp
++++ b/Core/Src/UnClass.cpp
+@@ -901,7 +901,15 @@ void UClass::Bind()
+ 		}
+ 		else if( !GIsEditor )
+ 		{
++#if defined(__EMSCRIPTEN__)
++			const char* VerifyEnv = getenv("WASM_VERIFY_NATIVES");
++			if( VerifyEnv && VerifyEnv[0] && VerifyEnv[0] != '0' )
++				debugf( NAME_Warning, TEXT("WASM_VERIFY_NATIVES: missing native class %s (%s)"), GetPathName(), ProcName );
++			else
++				appErrorf( TEXT("Can't bind to native class %s"), GetPathName() );
++#else
+ 			appErrorf( TEXT("Can't bind to native class %s"), GetPathName() );
++#endif
+ 		}
+ 	}
+ 	if( !ClassConstructor && GetSuperClass() )
+@@ -1658,6 +1666,14 @@ void UFunction::Bind()
+ 		// Find hardcoded native.
+ 		check(iNative<EX_Max);
+ 		check(GNatives[iNative]!=0);
++#if defined(__EMSCRIPTEN__)
++		if( GNatives[iNative] == &UObject::execUndefined )
++		{
++			const char* VerifyEnv = getenv("WASM_VERIFY_NATIVES");
++			if( VerifyEnv && VerifyEnv[0] && VerifyEnv[0] != '0' )
++				debugf( NAME_Warning, TEXT("WASM_VERIFY_NATIVES: missing iNative %i for %s (%s::%s)"), (INT)iNative, GetFullName(), GetOwnerClass()->GetNameCPP(), GetName() );
++		}
++#endif
+ 		Func = GNatives[iNative];
+ 	}
+ 	else
+diff --git a/Core/Src/UnCorSc.cpp b/Core/Src/UnCorSc.cpp
+index 49262a2..87cecc0 100644
+--- a/Core/Src/UnCorSc.cpp
++++ b/Core/Src/UnCorSc.cpp
+@@ -4784,6 +4784,123 @@ void UObject::execIsSoaking( FFrame& Stack, RESULT_DECL )
+ IMPLEMENT_FUNCTION( UObject, INDEX_NONE, execIsSoaking );
+ // --- gam
+ 
++static UBOOL GIsUTracing = 0;
++
++void UObject::execRandRange( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObject::execRandRange);
++	P_GET_FLOAT(Min);
++	P_GET_FLOAT(Max);
++	P_FINISH;
++	*(FLOAT*)Result = Min + (Max - Min) * appFrand();
++	unguardexecSlow;
++}
++IMPLEMENT_FUNCTION( UObject, INDEX_NONE, execRandRange );
++
++void UObject::execFloatToFormattedString( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObject::execFloatToFormattedString);
++	P_GET_FLOAT(MyFloat);
++	P_GET_INT_OPTX(Decimals, 2);
++	P_FINISH;
++	FString Format = FString::Printf( TEXT("%%.%df"), Decimals );
++	*(FString*)Result = FString::Printf( *Format, (DOUBLE)MyFloat );
++	unguardexecSlow;
++}
++IMPLEMENT_FUNCTION( UObject, INDEX_NONE, execFloatToFormattedString );
++
++void UObject::execIsUTracing( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObject::execIsUTracing);
++	P_FINISH;
++	*(UBOOL*)Result = GIsUTracing;
++	unguardexecSlow;
++}
++IMPLEMENT_FUNCTION( UObject, INDEX_NONE, execIsUTracing );
++
++void UObject::execSetUTracing( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObject::execSetUTracing);
++	P_GET_UBOOL(bNewUTracing);
++	P_FINISH;
++	GIsUTracing = bNewUTracing;
++	*(UBOOL*)Result = 0;
++	unguardexecSlow;
++}
++IMPLEMENT_FUNCTION( UObject, INDEX_NONE, execSetUTracing );
++
++void UObject::execGetModName( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObject::execGetModName);
++	P_FINISH;
++	*(FString*)Result = GModName;
++	unguardexecSlow;
++}
++IMPLEMENT_FUNCTION( UObject, INDEX_NONE, execGetModName );
++
++void UObject::execAllPackageFiles( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObject::execAllPackageFiles);
++	P_GET_STR_REF(FileName);
++	P_GET_STR_OPTX(FileExt, TEXT(""));
++	P_GET_STR_OPTX(Prefix, TEXT(""));
++	P_FINISH;
++
++	TArray<FString> PackageNames;
++	if( GSys )
++	{
++		for( INT i = 0; i < GSys->Paths.Num(); i++ )
++		{
++			FString Path = GSys->Paths(i);
++			INT Star = Path.InStr( TEXT("*") );
++			if( Star == INDEX_NONE )
++				continue;
++			FString Ext = Path.Mid( Star + 1 );
++			if( Ext.Left(1) == TEXT(".") )
++				Ext = Ext.Mid( 1 );
++			if( FileExt.Len() && appStricmp( *Ext, *FileExt ) != 0 )
++				continue;
++			TArray<FString> Files = GFileManager->FindFiles( *Path, 1, 0 );
++			for( INT j = 0; j < Files.Num(); j++ )
++			{
++				FString Base = Files(j);
++				INT Dot = Base.InStr( TEXT("."), 1 );
++				if( Dot != INDEX_NONE )
++					Base = Base.Left( Dot );
++				if( Prefix.Len() && appStrnicmp( *Base, *Prefix, Prefix.Len() ) != 0 )
++					continue;
++				UBOOL Exists = 0;
++				for( INT k = 0; k < PackageNames.Num(); k++ )
++				{
++					if( appStricmp( *PackageNames(k), *Base ) == 0 )
++					{
++						Exists = 1;
++						break;
++					}
++				}
++				if( !Exists )
++					new(PackageNames) FString( Base );
++			}
++		}
++	}
++
++	INT Index = 0;
++	PRE_ITERATOR;
++		if( Index < PackageNames.Num() )
++		{
++			*FileName = PackageNames(Index++);
++		}
++		else
++		{
++			*FileName = TEXT("");
++			Stack.Code = &Stack.Node->Script(wEndOffset + 1);
++			break;
++		}
++	POST_ITERATOR;
++	unguardexecSlow;
++}
++IMPLEMENT_FUNCTION( UObject, 198, execAllPackageFiles );
++
+ /*-----------------------------------------------------------------------------
+ 	Native registry.
+ -----------------------------------------------------------------------------*/
+diff --git a/Core/Src/UnCoreNative.cpp b/Core/Src/UnCoreNative.cpp
+index 3509318..23b27f0 100644
+--- a/Core/Src/UnCoreNative.cpp
++++ b/Core/Src/UnCoreNative.cpp
+@@ -308,6 +308,12 @@ UObjectNativeInfo GCoreUObjectNatives[] =
+ 	MAP_NATIVE( UObject, execPlatformIsUnix )
+ 	MAP_NATIVE( UObject, execPlatformIsWindows )
+ 	MAP_NATIVE( UObject, execPlatformIs64Bit )
++	MAP_NATIVE( UObject, execRandRange )
++	MAP_NATIVE( UObject, execFloatToFormattedString )
++	MAP_NATIVE( UObject, execIsUTracing )
++	MAP_NATIVE( UObject, execSetUTracing )
++	MAP_NATIVE( UObject, execGetModName )
++	MAP_NATIVE( UObject, execAllPackageFiles )
+ 	{NULL, NULL}
+ };
+ 
+diff --git a/Core/Src/UnObj.cpp b/Core/Src/UnObj.cpp
+index d3168ae..a43ee8d 100644
+--- a/Core/Src/UnObj.cpp
++++ b/Core/Src/UnObj.cpp
+@@ -5734,7 +5734,17 @@ void* UPackage::GetDllExport( const TCHAR* ExportName, UBOOL Checked )
+ 	if( !DllHandle )
+ 	{
+ 		if( Checked && !ParseParam(appCmdLine(),TEXT("nobind")) )
++#if defined(__EMSCRIPTEN__)
++		{
++			const char* VerifyEnv = getenv("WASM_VERIFY_NATIVES");
++			if( VerifyEnv && VerifyEnv[0] && VerifyEnv[0] != '0' )
++				debugf( NAME_Warning, TEXT("WASM_VERIFY_NATIVES: missing module %s for export %s"), GetName(), ExportName );
++			else
++				appErrorf( LocalizeError(TEXT("NotDll"),TEXT("Core")), GetName(), ExportName );
++		}
++#else
+ 			appErrorf( LocalizeError(TEXT("NotDll"),TEXT("Core")), GetName(), ExportName );
++#endif
+ 		Result = NULL;
+ 	}
+ 	else
+@@ -5746,7 +5756,17 @@ void* UPackage::GetDllExport( const TCHAR* ExportName, UBOOL Checked )
+ 		Result = appGetDllExport( DllHandle, ExportName );
+ 		#endif
+ 		if( !Result && Checked && !ParseParam(appCmdLine(),TEXT("nobind")) )
++#if defined(__EMSCRIPTEN__)
++		{
++			const char* VerifyEnv = getenv("WASM_VERIFY_NATIVES");
++			if( VerifyEnv && VerifyEnv[0] && VerifyEnv[0] != '0' )
++				debugf( NAME_Warning, TEXT("WASM_VERIFY_NATIVES: missing export %s in %s"), ExportName, GetName() );
++			else
++				appErrorf( LocalizeError(TEXT("NotInDll"),TEXT("Core")), ExportName, GetName() );
++		}
++#else
+ 			appErrorf( LocalizeError(TEXT("NotInDll"),TEXT("Core")), ExportName, GetName() );
++#endif
+ 		if( Result )
+ 			debugfSlow( NAME_DevBind, TEXT("Found %s in %s%s"), ExportName, GetName(), DLLEXT );
+ 		
+diff --git a/Engine/Inc/EngineClasses.h b/Engine/Inc/EngineClasses.h
+index f166731..8e48867 100644
+--- a/Engine/Inc/EngineClasses.h
++++ b/Engine/Inc/EngineClasses.h
+@@ -346,6 +346,16 @@ struct UStreamBase_eventGetPathRoot_Parms
+     FString InPath;
+     FString ReturnValue;
+ };
++class ENGINE_API UObjectPool : public UObject
++{
++public:
++    TArrayNoInit<class UObject*> Objects GCC_PACK(4);
++    DECLARE_FUNCTION(execAllocateObject);
++    DECLARE_FUNCTION(execFreeObject);
++    DECLARE_FUNCTION(execShrink);
++    DECLARE_CLASS(UObjectPool,UObject,0|CLASS_Transient,Engine)
++    NO_DEFAULT_CONSTRUCTOR(UObjectPool)
++};
+ class ENGINE_API UStreamBase : public UObject
+ {
+ public:
+@@ -2048,6 +2058,13 @@ public:
+     DECLARE_FUNCTION(execDrawStayingDebugLine);
+     DECLARE_FUNCTION(execDrawDebugLine);
+     DECLARE_FUNCTION(execGetRenderBoundingSphere);
++    DECLARE_FUNCTION(execHurtRadius);
++    DECLARE_FUNCTION(execTriggerEvent);
++    DECLARE_FUNCTION(execUntriggerEvent);
++    DECLARE_FUNCTION(execAllControllers);
++    DECLARE_FUNCTION(execKRagdollExists);
++    DECLARE_FUNCTION(execClearAttachedDecals);
++    DECLARE_FUNCTION(execDrawDebugBox);
+     DECLARE_FUNCTION(execGetUrlOption);
+     DECLARE_FUNCTION(execUpdateURL);
+     DECLARE_FUNCTION(execGetClosestBone);
+@@ -3401,6 +3418,7 @@ public:
+     DECLARE_FUNCTION(execUpdateDistanceFogLOD);
+     DECLARE_FUNCTION(execIsEntry);
+     DECLARE_FUNCTION(execDetailChange);
++    DECLARE_FUNCTION(execGetLocalPlayerController);
+     void eventServerTravel(const FString& URL, BITFIELD bItems)
+     {
+         ALevelInfo_eventServerTravel_Parms Parms;
+@@ -3669,6 +3687,11 @@ public:
+     DECLARE_FUNCTION(execDeleteDataObject);
+     DECLARE_FUNCTION(execCreateDataObject);
+     DECLARE_FUNCTION(execGetSavedGames);
++    DECLARE_FUNCTION(execMakeColorCode);
++    DECLARE_FUNCTION(execStripColor);
++    DECLARE_FUNCTION(execFromINIFormat);
++    DECLARE_FUNCTION(execGetCurrentTickRate);
++    DECLARE_FUNCTION(execGetConfiguredTickRate);
+     void eventNoTranslocatorKeyPressed(class APlayerController* PC)
+     {
+         AGameInfo_eventNoTranslocatorKeyPressed_Parms Parms;
+@@ -4160,6 +4183,7 @@ public:
+     DECLARE_FUNCTION(execGet4WayDirection);
+     DECLARE_FUNCTION(execSetTwistLook);
+     DECLARE_FUNCTION(execSetViewPitch);
++    DECLARE_FUNCTION(execAllInventory);
+     void eventPlayLandingAnimation(FLOAT impactVel)
+     {
+         APawn_eventPlayLandingAnimation_Parms Parms;
+@@ -7264,6 +7288,7 @@ public:
+     class AActor* HurtWall;
+     FLOAT MaxEffectDistance;
+     BITFIELD bScriptPostRender:1 GCC_PACK(4);
++    DECLARE_FUNCTION(execHurtRadius);
+     void eventPostRender2D(class UCanvas* C, FLOAT ScreenLocX, FLOAT ScreenLocY)
+     {
+         AProjectile_eventPostRender2D_Parms Parms;
+@@ -10037,6 +10062,24 @@ AUTOGENERATE_FUNCTION(AGameStats,-1,execGetStatsIdentifier);
+ AUTOGENERATE_FUNCTION(AFileLog,-1,execLogf);
+ AUTOGENERATE_FUNCTION(AFileLog,-1,execCloseLog);
+ AUTOGENERATE_FUNCTION(AFileLog,-1,execOpenLog);
++AUTOGENERATE_FUNCTION(UObjectPool,-1,execAllocateObject);
++AUTOGENERATE_FUNCTION(UObjectPool,-1,execFreeObject);
++AUTOGENERATE_FUNCTION(UObjectPool,-1,execShrink);
++AUTOGENERATE_FUNCTION(AActor,-1,execHurtRadius);
++AUTOGENERATE_FUNCTION(AActor,-1,execTriggerEvent);
++AUTOGENERATE_FUNCTION(AActor,-1,execUntriggerEvent);
++AUTOGENERATE_FUNCTION(AActor,325,execAllControllers);
++AUTOGENERATE_FUNCTION(AActor,-1,execKRagdollExists);
++AUTOGENERATE_FUNCTION(AActor,-1,execClearAttachedDecals);
++AUTOGENERATE_FUNCTION(AActor,-1,execDrawDebugBox);
++AUTOGENERATE_FUNCTION(ALevelInfo,-1,execGetLocalPlayerController);
++AUTOGENERATE_FUNCTION(AProjectile,-1,execHurtRadius);
++AUTOGENERATE_FUNCTION(AGameInfo,-1,execMakeColorCode);
++AUTOGENERATE_FUNCTION(AGameInfo,-1,execStripColor);
++AUTOGENERATE_FUNCTION(AGameInfo,-1,execFromINIFormat);
++AUTOGENERATE_FUNCTION(AGameInfo,-1,execGetCurrentTickRate);
++AUTOGENERATE_FUNCTION(AGameInfo,-1,execGetConfiguredTickRate);
++AUTOGENERATE_FUNCTION(APawn,326,execAllInventory);
+ 
+ #ifndef NAMES_ONLY
+ #undef AUTOGENERATE_NAME
+@@ -10050,6 +10093,8 @@ AUTOGENERATE_FUNCTION(AFileLog,-1,execOpenLog);
+ 
+ #ifdef NATIVE_DEFS_ONLY
+ DECLARE_NATIVE_TYPE(Engine,UStreamTag);
++DECLARE_NATIVE_TYPE(Engine,UObjectPool);
++DECLARE_NATIVE_TYPE(Engine,AProjectile);
+ DECLARE_NATIVE_TYPE(Engine,UStreamBase);
+ DECLARE_NATIVE_TYPE(Engine,UStream);
+ DECLARE_NATIVE_TYPE(Engine,UStreamInterface);
+@@ -10817,6 +10862,13 @@ NATIVE_INFO(AActor) GEngineAActorNatives[] =
+ 	MAP_NATIVE(AActor,execTextToSpeech)
+ 	MAP_NATIVE(AActor,execCopyObjectToClipboard)
+ 	MAP_NATIVE(AActor,execConsoleCommand)
++	MAP_NATIVE(AActor,execHurtRadius)
++	MAP_NATIVE(AActor,execTriggerEvent)
++	MAP_NATIVE(AActor,execUntriggerEvent)
++	MAP_NATIVE(AActor,execAllControllers)
++	MAP_NATIVE(AActor,execKRagdollExists)
++	MAP_NATIVE(AActor,execClearAttachedDecals)
++	MAP_NATIVE(AActor,execDrawDebugBox)
+ 	{NULL,NULL}
+ };
+ IMPLEMENT_NATIVE_HANDLER(Engine,AActor);
+@@ -10867,6 +10919,7 @@ NATIVE_INFO(APawn) GEngineAPawnNatives[] =
+ 	MAP_NATIVE(APawn,execGet4WayDirection)
+ 	MAP_NATIVE(APawn,execSetTwistLook)
+ 	MAP_NATIVE(APawn,execSetViewPitch)
++	MAP_NATIVE(APawn,execAllInventory)
+ 	{NULL,NULL}
+ };
+ IMPLEMENT_NATIVE_HANDLER(Engine,APawn);
+@@ -11121,6 +11174,11 @@ NATIVE_INFO(AGameInfo) GEngineAGameInfoNatives[] =
+ 	MAP_NATIVE(AGameInfo,execDeleteDataObject)
+ 	MAP_NATIVE(AGameInfo,execCreateDataObject)
+ 	MAP_NATIVE(AGameInfo,execGetSavedGames)
++	MAP_NATIVE(AGameInfo,execMakeColorCode)
++	MAP_NATIVE(AGameInfo,execStripColor)
++	MAP_NATIVE(AGameInfo,execFromINIFormat)
++	MAP_NATIVE(AGameInfo,execGetCurrentTickRate)
++	MAP_NATIVE(AGameInfo,execGetConfiguredTickRate)
+ 	{NULL,NULL}
+ };
+ IMPLEMENT_NATIVE_HANDLER(Engine,AGameInfo);
+@@ -11137,6 +11195,7 @@ NATIVE_INFO(ALevelInfo) GEngineALevelInfoNatives[] =
+ 	MAP_NATIVE(ALevelInfo,execUpdateDistanceFogLOD)
+ 	MAP_NATIVE(ALevelInfo,execIsEntry)
+ 	MAP_NATIVE(ALevelInfo,execDetailChange)
++	MAP_NATIVE(ALevelInfo,execGetLocalPlayerController)
+ 	{NULL,NULL}
+ };
+ IMPLEMENT_NATIVE_HANDLER(Engine,ALevelInfo);
+@@ -11202,6 +11261,22 @@ NATIVE_INFO(AFileLog) GEngineAFileLogNatives[] =
+ };
+ IMPLEMENT_NATIVE_HANDLER(Engine,AFileLog);
+ 
++NATIVE_INFO(UObjectPool) GEngineUObjectPoolNatives[] = 
++{ 
++	MAP_NATIVE(UObjectPool,execAllocateObject)
++	MAP_NATIVE(UObjectPool,execFreeObject)
++	MAP_NATIVE(UObjectPool,execShrink)
++	{NULL,NULL}
++};
++IMPLEMENT_NATIVE_HANDLER(Engine,UObjectPool);
++
++NATIVE_INFO(AProjectile) GEngineAProjectileNatives[] = 
++{ 
++	MAP_NATIVE(AProjectile,execHurtRadius)
++	{NULL,NULL}
++};
++IMPLEMENT_NATIVE_HANDLER(Engine,AProjectile);
++
+ #endif // NATIVES_ONLY
+ 
+ #ifdef VERIFY_CLASS_SIZES
+diff --git a/Engine/Src/UnScript.cpp b/Engine/Src/UnScript.cpp
+index 58c1026..004911c 100644
+--- a/Engine/Src/UnScript.cpp
++++ b/Engine/Src/UnScript.cpp
+@@ -3731,6 +3731,477 @@ void AActor::execUnClock(FFrame& Stack,RESULT_DECL)
+ 	unguard;
+ }
+ 
++/*-----------------------------------------------------------------------------
++	3374 Native Surface Additions.
++-----------------------------------------------------------------------------*/
++
++IMPLEMENT_CLASS(UObjectPool);
++
++void UObjectPool::execAllocateObject( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObjectPool::execAllocateObject);
++	P_GET_OBJECT(UClass, ObjectClass);
++	P_FINISH;
++	if( !ObjectClass )
++	{
++		Stack.Log( NAME_ScriptWarning, TEXT("AllocateObject: None ObjectClass") );
++		*(UObject**)Result = NULL;
++		return;
++	}
++	for( INT i = Objects.Num() - 1; i >= 0; i-- )
++	{
++		UObject* Obj = Objects(i);
++		if( !Obj )
++		{
++			Objects.Remove( i );
++			continue;
++		}
++		if( Obj->GetClass() == ObjectClass )
++		{
++			*(UObject**)Result = Obj;
++			Objects.Remove( i );
++			return;
++		}
++	}
++	*(UObject**)Result = StaticConstructObject( ObjectClass, GetOuter(), NAME_None, RF_Transient );
++	unguardexecSlow;
++}
++
++void UObjectPool::execFreeObject( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObjectPool::execFreeObject);
++	P_GET_OBJECT(UObject, Obj);
++	P_FINISH;
++	if( Obj )
++		Objects.AddItem( Obj );
++	else
++		Stack.Log( NAME_ScriptWarning, TEXT("FreeObject: None Obj") );
++	unguardexecSlow;
++}
++
++void UObjectPool::execShrink( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(UObjectPool::execShrink);
++	P_FINISH;
++	Objects.Empty();
++	unguardexecSlow;
++}
++
++void ALevelInfo::execGetLocalPlayerController( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(ALevelInfo::execGetLocalPlayerController);
++	P_FINISH;
++	if( LocalPlayerController )
++	{
++		*(APlayerController**)Result = LocalPlayerController;
++		return;
++	}
++	if( XLevel && XLevel->Engine && XLevel->Engine->Client && XLevel->Engine->Client->Viewports.Num() && XLevel->Engine->Client->Viewports(0) )
++	{
++		LocalPlayerController = XLevel->Engine->Client->Viewports(0)->Actor;
++		*(APlayerController**)Result = LocalPlayerController;
++		return;
++	}
++	for( AController* C = ControllerList; C; C = C->nextController )
++	{
++		APlayerController* PC = Cast<APlayerController>(C);
++		if( PC && Cast<UViewport>(PC->Player) )
++		{
++			LocalPlayerController = PC;
++			*(APlayerController**)Result = LocalPlayerController;
++			return;
++		}
++	}
++	*(APlayerController**)Result = NULL;
++	unguardexecSlow;
++}
++
++void AActor::execTriggerEvent( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AActor::execTriggerEvent);
++	P_GET_NAME(EventName);
++	P_GET_ACTOR(Other);
++	P_GET_OBJECT(APawn, EventInstigator);
++	P_FINISH;
++	if( EventName == NAME_None || !XLevel )
++		return;
++	for( INT i = 0; i < XLevel->Actors.Num(); i++ )
++	{
++		AActor* A = XLevel->Actors(i);
++		if( A && !A->IsPendingKill() && A->Tag == EventName && A->IsProbing(ENGINE_Trigger) )
++			A->eventTrigger( Other, EventInstigator );
++	}
++	unguardexecSlow;
++}
++
++void AActor::execUntriggerEvent( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AActor::execUntriggerEvent);
++	P_GET_NAME(EventName);
++	P_GET_ACTOR(Other);
++	P_GET_OBJECT(APawn, EventInstigator);
++	P_FINISH;
++	if( EventName == NAME_None || !XLevel )
++		return;
++	for( INT i = 0; i < XLevel->Actors.Num(); i++ )
++	{
++		AActor* A = XLevel->Actors(i);
++		if( A && !A->IsPendingKill() && A->Tag == EventName && A->IsProbing(ENGINE_UnTrigger) )
++			A->eventUnTrigger( Other, EventInstigator );
++	}
++	unguardexecSlow;
++}
++
++void AActor::execAllControllers( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AActor::execAllControllers);
++	P_GET_OBJECT(UClass, BaseClass);
++	P_GET_ACTOR_REF(OutActor);
++	P_FINISH;
++
++	AController* C = Level ? Level->ControllerList : NULL;
++	UBOOL CheckClass = (BaseClass && BaseClass != AController::StaticClass());
++
++	PRE_ITERATOR;
++		*OutActor = NULL;
++		while( C && *OutActor == NULL )
++		{
++			AController* Cur = C;
++			C = C->nextController;
++			if( !Cur->IsPendingKill() && (!CheckClass || Cur->IsA(BaseClass)) )
++				*OutActor = Cur;
++		}
++		if( *OutActor == NULL )
++		{
++			Stack.Code = &Stack.Node->Script(wEndOffset + 1);
++			break;
++		}
++	POST_ITERATOR;
++	unguardexecSlow;
++}
++
++void APawn::execAllInventory( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(APawn::execAllInventory);
++	P_GET_OBJECT(UClass, BaseClass);
++	P_GET_ACTOR_REF(OutActor);
++	P_FINISH;
++
++	AInventory* Inv = Inventory;
++	UBOOL CheckClass = (BaseClass && BaseClass != AInventory::StaticClass());
++	INT Steps = 0;
++
++	PRE_ITERATOR;
++		*OutActor = NULL;
++		while( Inv && Steps < 1000 && *OutActor == NULL )
++		{
++			AInventory* Cur = Inv;
++			Inv = Inv->Inventory;
++			Steps++;
++			if( !Cur->IsPendingKill() && (!CheckClass || Cur->IsA(BaseClass)) )
++				*OutActor = Cur;
++		}
++		if( *OutActor == NULL )
++		{
++			Stack.Code = &Stack.Node->Script(wEndOffset + 1);
++			break;
++		}
++	POST_ITERATOR;
++	unguardexecSlow;
++}
++
++void AActor::execKRagdollExists( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AActor::execKRagdollExists);
++	P_GET_STR(RagdollName);
++	P_FINISH;
++	*(UBOOL*)Result = 0;
++	unguardexecSlow;
++}
++
++void AActor::execClearAttachedDecals( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AActor::execClearAttachedDecals);
++	P_FINISH;
++	for( INT i = 0; i < Projectors.Num(); i++ )
++		if( Projectors(i) )
++			Projectors(i)->RemoveReference();
++	Projectors.Empty();
++	unguardexecSlow;
++}
++
++void AActor::execDrawDebugBox( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AActor::execDrawDebugBox);
++	P_GET_VECTOR(DiagonalStart);
++	P_GET_VECTOR(DiagonalEnd);
++	P_GET_BYTE(R);
++	P_GET_BYTE(G);
++	P_GET_BYTE(B);
++	P_GET_UBOOL_OPTX(bStaying, 0);
++	P_FINISH;
++	if( GTempLineBatcher )
++		GTempLineBatcher->AddBox( FBox(DiagonalStart, DiagonalEnd), FColor(R, G, B) );
++	unguardexecSlow;
++}
++
++static void CallDriverRadiusDamage( AVehicle* V, FLOAT DamageAmount, FLOAT DamageRadius, AController* InstigatorController, UClass* DamageType, FLOAT Momentum, FVector HitLocation )
++{
++	struct FDriverRadiusDamageParms
++	{
++		FLOAT DamageAmount;
++		FLOAT DamageRadius;
++		AController* EventInstigator;
++		UClass* DamageType;
++		FLOAT Momentum;
++		FVector HitLocation;
++	} Parms;
++	Parms.DamageAmount = DamageAmount;
++	Parms.DamageRadius = DamageRadius;
++	Parms.EventInstigator = InstigatorController;
++	Parms.DamageType = DamageType;
++	Parms.Momentum = Momentum;
++	Parms.HitLocation = HitLocation;
++	UFunction* Fn = V->FindFunction( FName(TEXT("DriverRadiusDamage"), FNAME_Find) );
++	if( Fn )
++		V->ProcessEvent( Fn, &Parms );
++}
++
++static void CallSetDelayedDamageInstigatorController( AActor* Victim, AController* C )
++{
++	struct FParms { AController* C; } Parms = { C };
++	UFunction* Fn = Victim->FindFunction( FName(TEXT("SetDelayedDamageInstigatorController"), FNAME_Find) );
++	if( Fn )
++		Victim->ProcessEvent( Fn, &Parms );
++}
++
++void AActor::execHurtRadius( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AActor::execHurtRadius);
++	P_GET_FLOAT(DamageAmount);
++	P_GET_FLOAT(DamageRadius);
++	P_GET_OBJECT(UClass, DamageType);
++	P_GET_FLOAT(Momentum);
++	P_GET_VECTOR(HitLocation);
++	P_FINISH;
++
++	if( bHurtEntry || !XLevel || !XLevel->Hash )
++		return;
++	bHurtEntry = 1;
++	FMemMark Mark(GMem);
++	FCheckResult* Link = XLevel->Hash->ActorRadiusCheck( GMem, HitLocation, DamageRadius, 0 );
++	for( ; Link; Link = Link->GetNext() )
++	{
++		AActor* Victim = Link->Actor;
++		if( !Victim || Victim == this || Victim->IsPendingKill() || Victim->Role != ROLE_Authority || Victim->IsA(AFluidSurfaceInfo::StaticClass()) )
++			continue;
++		UFunction* TakeDamageFn = Victim->FindFunction( ENGINE_TakeDamage );
++		if( !TakeDamageFn || !(TakeDamageFn->FunctionFlags & FUNC_Defined) )
++			continue;
++		FCheckResult Hit(1.f);
++		XLevel->SingleLineCheck( Hit, this, Victim->Location, HitLocation, TRACE_World );
++		if( Hit.Actor && Hit.Actor != Victim )
++			continue;
++		FVector Dir = Victim->Location - HitLocation;
++		FLOAT Dist = Max<FLOAT>( 1.f, Dir.Size() );
++		Dir = Dir / Dist;
++		FLOAT DamageScale = 1.f - Max<FLOAT>( 0.f, (Dist - Victim->CollisionRadius) / DamageRadius );
++		Victim->eventTakeDamage(
++			appFloor( DamageScale * DamageAmount ),
++			Instigator,
++			Victim->Location - 0.5f * (Victim->CollisionHeight + Victim->CollisionRadius) * Dir,
++			DamageScale * Momentum * Dir,
++			DamageType
++		);
++		AVehicle* V = Cast<AVehicle>(Victim);
++		if( Instigator && V && !V->IsPendingKill() && V->Health > 0 )
++			CallDriverRadiusDamage( V, DamageAmount, DamageRadius, Instigator->Controller, DamageType, Momentum, HitLocation );
++	}
++	Mark.Pop();
++	bHurtEntry = 0;
++	unguardexecSlow;
++}
++
++void AProjectile::execHurtRadius( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AProjectile::execHurtRadius);
++	P_GET_FLOAT(DamageAmount);
++	P_GET_FLOAT(DamageRadius);
++	P_GET_OBJECT(UClass, DamageType);
++	P_GET_FLOAT(Momentum);
++	P_GET_VECTOR(HitLocation);
++	P_FINISH;
++
++	if( bHurtEntry || !XLevel || !XLevel->Hash )
++		return;
++	bHurtEntry = 1;
++	FMemMark Mark(GMem);
++	FCheckResult* Link = XLevel->Hash->ActorRadiusCheck( GMem, HitLocation, DamageRadius, 0 );
++	for( ; Link; Link = Link->GetNext() )
++	{
++		AActor* Victim = Link->Actor;
++		if( !Victim || Victim == this || Victim == HurtWall || Victim->IsPendingKill() || Victim->Role != ROLE_Authority || Victim->IsA(AFluidSurfaceInfo::StaticClass()) )
++		{
++			if( Victim == LastTouched )
++				LastTouched = NULL;
++			continue;
++		}
++		UFunction* TakeDamageFn = Victim->FindFunction( ENGINE_TakeDamage );
++		if( !TakeDamageFn || !(TakeDamageFn->FunctionFlags & FUNC_Defined) )
++			continue;
++		if( Victim != LastTouched )
++		{
++			FCheckResult Hit(1.f);
++			XLevel->SingleLineCheck( Hit, this, Victim->Location, HitLocation, TRACE_World );
++			if( Hit.Actor && Hit.Actor != Victim )
++				continue;
++		}
++		FVector Dir = Victim->Location - HitLocation;
++		FLOAT Dist = Max<FLOAT>( 1.f, Dir.Size() );
++		Dir = Dir / Dist;
++		FLOAT DamageScale = 1.f - Max<FLOAT>( 0.f, (Dist - Victim->CollisionRadius) / DamageRadius );
++		if( !Instigator || !Instigator->Controller )
++			CallSetDelayedDamageInstigatorController( Victim, InstigatorController );
++		if( Victim == LastTouched )
++			LastTouched = NULL;
++		Victim->eventTakeDamage(
++			appFloor( DamageScale * DamageAmount ),
++			Instigator,
++			Victim->Location - 0.5f * (Victim->CollisionHeight + Victim->CollisionRadius) * Dir,
++			DamageScale * Momentum * Dir,
++			DamageType
++		);
++		AVehicle* V = Cast<AVehicle>(Victim);
++		if( Instigator && V && !V->IsPendingKill() && V->Health > 0 )
++			CallDriverRadiusDamage( V, DamageAmount, DamageRadius, InstigatorController, DamageType, Momentum, HitLocation );
++	}
++	if( LastTouched && LastTouched != this && !LastTouched->IsPendingKill() && LastTouched->Role == ROLE_Authority && !LastTouched->IsA(AFluidSurfaceInfo::StaticClass()) )
++	{
++		AActor* Victim = LastTouched;
++		LastTouched = NULL;
++		FVector Dir = Victim->Location - HitLocation;
++		FLOAT Dist = Max<FLOAT>( 1.f, Dir.Size() );
++		Dir = Dir / Dist;
++		FLOAT DamageScale = Max<FLOAT>( Victim->CollisionRadius / (Victim->CollisionRadius + Victim->CollisionHeight), 1.f - Max<FLOAT>( 0.f, (Dist - Victim->CollisionRadius) / DamageRadius ) );
++		if( !Instigator || !Instigator->Controller )
++			CallSetDelayedDamageInstigatorController( Victim, InstigatorController );
++		Victim->eventTakeDamage(
++			(INT)( DamageScale * DamageAmount ),
++			Instigator,
++			Victim->Location - 0.5f * (Victim->CollisionHeight + Victim->CollisionRadius) * Dir,
++			DamageScale * Momentum * Dir,
++			DamageType
++		);
++		AVehicle* V = Cast<AVehicle>(Victim);
++		if( Instigator && V && !V->IsPendingKill() && V->Health > 0 )
++			CallDriverRadiusDamage( V, DamageAmount, DamageRadius, InstigatorController, DamageType, Momentum, HitLocation );
++	}
++	Mark.Pop();
++	bHurtEntry = 0;
++	unguardexecSlow;
++}
++
++void AGameInfo::execMakeColorCode( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AGameInfo::execMakeColorCode);
++	P_GET_STRUCT(FColor, NewColor);
++	P_FINISH;
++	TCHAR Buf[5];
++	Buf[0] = 0x1B;
++	Buf[1] = Max<INT>( NewColor.R, 1 );
++	Buf[2] = Max<INT>( NewColor.G, 1 );
++	Buf[3] = Max<INT>( NewColor.B, 1 );
++	Buf[4] = 0;
++	*(FString*)Result = Buf;
++	unguardexecSlow;
++}
++
++void AGameInfo::execStripColor( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AGameInfo::execStripColor);
++	P_GET_STR(S);
++	P_FINISH;
++	FString Out;
++	const TCHAR* Ptr = *S;
++	while( *Ptr )
++	{
++		if( *Ptr == 0x1B )
++		{
++			if( Ptr[1] && Ptr[2] && Ptr[3] )
++			{
++				Ptr += 4;
++				continue;
++			}
++			break;
++		}
++		TCHAR Ch[2] = { *Ptr++, 0 };
++		Out += Ch;
++	}
++	*(FString*)Result = Out;
++	unguardexecSlow;
++}
++
++static inline INT HexVal( TCHAR C )
++{
++	if( C >= '0' && C <= '9' ) return C - '0';
++	if( C >= 'a' && C <= 'f' ) return C - 'a' + 10;
++	if( C >= 'A' && C <= 'F' ) return C - 'A' + 10;
++	return -1;
++}
++
++void AGameInfo::execFromINIFormat( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AGameInfo::execFromINIFormat);
++	P_GET_STR(S);
++	P_FINISH;
++	FString Out;
++	const TCHAR* Ptr = *S;
++	while( *Ptr )
++	{
++		if( Ptr[0] == '(' && Ptr[1] == '#' &&
++			HexVal(Ptr[2]) >= 0 && HexVal(Ptr[3]) >= 0 &&
++			HexVal(Ptr[4]) >= 0 && HexVal(Ptr[5]) >= 0 &&
++			HexVal(Ptr[6]) >= 0 && HexVal(Ptr[7]) >= 0 &&
++			Ptr[8] == ')' )
++		{
++			TCHAR Code[5];
++			Code[0] = 0x1B;
++			Code[1] = Max<INT>( (HexVal(Ptr[2]) << 4) | HexVal(Ptr[3]), 1 );
++			Code[2] = Max<INT>( (HexVal(Ptr[4]) << 4) | HexVal(Ptr[5]), 1 );
++			Code[3] = Max<INT>( (HexVal(Ptr[6]) << 4) | HexVal(Ptr[7]), 1 );
++			Code[4] = 0;
++			Out += Code;
++			Ptr += 9;
++			continue;
++		}
++		TCHAR Ch[2] = { *Ptr++, 0 };
++		Out += Ch;
++	}
++	*(FString*)Result = Out;
++	unguardexecSlow;
++}
++
++void AGameInfo::execGetCurrentTickRate( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AGameInfo::execGetCurrentTickRate);
++	P_FINISH;
++	*(FLOAT*)Result = (XLevel && XLevel->Engine) ? XLevel->Engine->CurrentTickRate : 0.f;
++	unguardexecSlow;
++}
++
++void AGameInfo::execGetConfiguredTickRate( FFrame& Stack, RESULT_DECL )
++{
++	guardSlow(AGameInfo::execGetConfiguredTickRate);
++	P_FINISH;
++	if( XLevel && XLevel->NetDriver )
++		*(INT*)Result = XLevel->NetDriver->NetServerMaxTickRate;
++	else if( XLevel && XLevel->Engine )
++		*(INT*)Result = appRound( XLevel->Engine->GetMaxTickRate() );
++	else
++		*(INT*)Result = 0;
++	unguardexecSlow;
++}
++
+ /*-----------------------------------------------------------------------------
+ 	The End.
+ -----------------------------------------------------------------------------*/
+diff --git a/IpDrv/Inc/IpDrvClasses.h b/IpDrv/Inc/IpDrvClasses.h
+index ccfcf7b..2be4906 100644
+--- a/IpDrv/Inc/IpDrvClasses.h
++++ b/IpDrv/Inc/IpDrvClasses.h
+@@ -391,6 +391,7 @@ public:
+     DECLARE_FUNCTION(execLogStatLine);
+     DECLARE_FUNCTION(execForceGameStateRefresh);
+     DECLARE_FUNCTION(execReconnect);
++    DECLARE_FUNCTION(execNetworkConnect);
+     BITFIELD eventLogStatLine(const FString& StatLine)
+     {
+         AMasterServerUplink_eventLogStatLine_Parms Parms;
+@@ -623,6 +624,22 @@ public:
+ 
+ };
+ 
++class IPDRV_API AMasterServerClientLauncher : public AMasterServerClient
++{
++public:
++    TArrayNoInit<class AMasterServerClient*> MyServers GCC_PACK(4);
++    INT QueriesFinished;
++    BYTE BestResponseInfo;
++    TArrayNoInit<FString> MyGameServers GCC_PACK(4);
++    FStringNoInit MyMOTD;
++    BYTE CurrentCommand;
++    TArrayNoInit<INT> UsedMasterServers GCC_PACK(4);
++    INT MyResultCount;
++    DECLARE_FUNCTION(execSetResultCount);
++    DECLARE_CLASS(AMasterServerClientLauncher,AMasterServerClient,0|CLASS_Transient|CLASS_Config,IpDrv)
++    NO_DEFAULT_CONSTRUCTOR(AMasterServerClientLauncher)
++};
++
+ #endif
+ 
+ AUTOGENERATE_FUNCTION(AUdpLink,-1,execReadBinary);
+@@ -651,10 +668,12 @@ AUTOGENERATE_FUNCTION(ATcpLink,-1,execBindPort);
+ AUTOGENERATE_FUNCTION(AMasterServerUplink,-1,execLogStatLine);
+ AUTOGENERATE_FUNCTION(AMasterServerUplink,-1,execForceGameStateRefresh);
+ AUTOGENERATE_FUNCTION(AMasterServerUplink,-1,execReconnect);
++AUTOGENERATE_FUNCTION(AMasterServerUplink,-1,execNetworkConnect);
+ AUTOGENERATE_FUNCTION(AMasterServerLink,-1,execPoll);
+ AUTOGENERATE_FUNCTION(AMasterServerClient,-1,execLaunchAutoUpdate);
+ AUTOGENERATE_FUNCTION(AMasterServerClient,-1,execStop);
+ AUTOGENERATE_FUNCTION(AMasterServerClient,-1,execStartQuery);
++AUTOGENERATE_FUNCTION(AMasterServerClientLauncher,-1,execSetResultCount);
+ AUTOGENERATE_FUNCTION(AServerQueryClient,-1,execNetworkError);
+ AUTOGENERATE_FUNCTION(AServerQueryClient,-1,execCancelPings);
+ AUTOGENERATE_FUNCTION(AServerQueryClient,-1,execPingServer);
+@@ -678,6 +697,7 @@ DECLARE_NATIVE_TYPE(IpDrv,AMasterServerUplink);
+ DECLARE_NATIVE_TYPE(IpDrv,AMasterServerLink);
+ DECLARE_NATIVE_TYPE(IpDrv,AMasterServerClient);
+ DECLARE_NATIVE_TYPE(IpDrv,AServerQueryClient);
++DECLARE_NATIVE_TYPE(IpDrv,AMasterServerClientLauncher);
+ 
+ #define AUTO_INITIALIZE_REGISTRANTS_IPDRV \
+ 	AUdpLink::StaticClass(); \
+@@ -750,6 +770,7 @@ NATIVE_INFO(AMasterServerUplink) GIpDrvAMasterServerUplinkNatives[] =
+ 	MAP_NATIVE(AMasterServerUplink,execLogStatLine)
+ 	MAP_NATIVE(AMasterServerUplink,execForceGameStateRefresh)
+ 	MAP_NATIVE(AMasterServerUplink,execReconnect)
++	MAP_NATIVE(AMasterServerUplink,execNetworkConnect)
+ 	{NULL,NULL}
+ };
+ IMPLEMENT_NATIVE_HANDLER(IpDrv,AMasterServerUplink);
+@@ -770,6 +791,13 @@ NATIVE_INFO(AMasterServerClient) GIpDrvAMasterServerClientNatives[] =
+ };
+ IMPLEMENT_NATIVE_HANDLER(IpDrv,AMasterServerClient);
+ 
++NATIVE_INFO(AMasterServerClientLauncher) GIpDrvAMasterServerClientLauncherNatives[] = 
++{ 
++	MAP_NATIVE(AMasterServerClientLauncher,execSetResultCount)
++	{NULL,NULL}
++};
++IMPLEMENT_NATIVE_HANDLER(IpDrv,AMasterServerClientLauncher);
++
+ NATIVE_INFO(AServerQueryClient) GIpDrvAServerQueryClientNatives[] = 
+ { 
+ 	MAP_NATIVE(AServerQueryClient,execNetworkError)
+diff --git a/IpDrv/Src/MasterServerClient.cpp b/IpDrv/Src/MasterServerClient.cpp
+index 80fc39f..6627aea 100644
+--- a/IpDrv/Src/MasterServerClient.cpp
++++ b/IpDrv/Src/MasterServerClient.cpp
+@@ -932,6 +932,16 @@ void AMasterServerClient::execLaunchAutoUpdate( FFrame& Stack, RESULT_DECL )
+ 
+ IMPLEMENT_CLASS(AMasterServerClient);
+ 
++void AMasterServerClientLauncher::execSetResultCount( FFrame& Stack, RESULT_DECL )
++{
++	guard(AMasterServerClientLauncher::execSetResultCount);
++	P_GET_INT(Count);
++	P_FINISH;
++	ResultCount = Count;
++	unguard;
++}
++IMPLEMENT_CLASS(AMasterServerClientLauncher);
++
+ /*-----------------------------------------------------------------------------
+ 	The End.
+ -----------------------------------------------------------------------------*/
+diff --git a/IpDrv/Src/MasterServerUplink.cpp b/IpDrv/Src/MasterServerUplink.cpp
+index ab0307f..ecab66d 100644
+--- a/IpDrv/Src/MasterServerUplink.cpp
++++ b/IpDrv/Src/MasterServerUplink.cpp
+@@ -950,6 +950,13 @@ void AMasterServerUplink::execReconnect( FFrame& Stack, RESULT_DECL )
+ 		GWarn->Logf(TEXT("MasterServerUplink: DoUplink is False, not connecting to Epic master server"));
+ }
+ 
++void AMasterServerUplink::execNetworkConnect( FFrame& Stack, RESULT_DECL )
++{
++	P_FINISH;
++	if( !LinkPtr )
++		LinkPtr = (PTRINT)(new FMasterServerUplinkLink(this));
++}
++
+ void AMasterServerUplink::execForceGameStateRefresh( FFrame& Stack, RESULT_DECL )
+ {
+ 	P_GET_INT(When);
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 26781c0..c0c0c57 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -10,9 +10,9 @@
+ #include <unistd.h>
+ #include <emscripten.h>
+ 
+-#if defined(UT2004_WEB_CLIENT)
++extern "C" void RegisterNamesOnslaught(void);
+ extern "C" void RegisterNamesXInterface(void);
+-// One atomic mailbox: JS can queue during Asyncify waits, never mutate a viewport.
++#if defined(UT2004_WEB_CLIENT)
+ static unsigned PendingResolution;
+ extern "C" EMSCRIPTEN_KEEPALIVE int ut2004_request_resolution(int w, int h)
+ {
+@@ -88,8 +88,9 @@ int main(int argc, char** argv)
+     const TCHAR* CommandLine = TEXT("-nohomedir -nosound");
+ #endif
+     appInit(TEXT("UT2004"), CommandLine, &Malloc, &Log, &Error, &Warn, &Files, FConfigCacheIni::Factory, 1);
+-#if defined(UT2004_WEB_CLIENT)
++    RegisterNamesOnslaught();
+     RegisterNamesXInterface();
++#if defined(UT2004_WEB_CLIENT)
+     GIsScriptable = 1;
+     GConfig->SetString(TEXT("Engine.Engine"), TEXT("ViewportManager"), TEXT("SDLDrv.SDLClient"));
+     GConfig->SetString(TEXT("Engine.Engine"), TEXT("RenderDevice"), TEXT("OpenGLDrv.OpenGLRenderDevice"));
+@@ -141,6 +142,18 @@ int main(int argc, char** argv)
+         debugf(NAME_Init, TEXT("WASM: Core package loaded"));
+         UObject::LoadPackage(NULL, TEXT("Engine"), LOAD_NoFail);
+         debugf(NAME_Init, TEXT("WASM: Engine package loaded"));
++        const char* VerifyNativesEnv = getenv("WASM_VERIFY_NATIVES");
++        if (VerifyNativesEnv && VerifyNativesEnv[0] && VerifyNativesEnv[0] != '0')
++        {
++            const TCHAR* VerifyPkgs[] = {
++                TEXT("IpDrv"), TEXT("UWeb"), TEXT("Fire"), TEXT("XGame"), TEXT("XInterface"), TEXT("Onslaught")
++            };
++            for (INT I = 0; I < (INT)(sizeof(VerifyPkgs) / sizeof(VerifyPkgs[0])); ++I)
++            {
++                UObject::LoadPackage(NULL, VerifyPkgs[I], LOAD_NoWarn);
++                debugf(NAME_Init, TEXT("WASM_VERIFY_NATIVES: checked package %s"), VerifyPkgs[I]);
++            }
++        }
+         UClass* EngineClass = UObject::StaticLoadClass(UGameEngine::StaticClass(), NULL,
+             TEXT("ini:Engine.Engine.GameEngine"), NULL, LOAD_NoFail, NULL);
+         UEngine* Engine = ConstructObject<UEngine>(EngineClass);
+diff --git a/Onslaught/Src/ONSWheeledCraft.cpp b/Onslaught/Src/ONSWheeledCraft.cpp
+index 5174e64..9505aca 100644
+--- a/Onslaught/Src/ONSWheeledCraft.cpp
++++ b/Onslaught/Src/ONSWheeledCraft.cpp
+@@ -683,4 +683,4 @@ void AONSWheeledCraft::PackState()
+ 
+ #endif // WITH_KARMA
+ 
+-//IMPLEMENT_CLASS(AONSWheeledCraft); ///EM Already implemented in ONSWheeledCraft.cpp
++IMPLEMENT_CLASS(AONSWheeledCraft);
+diff --git a/Onslaught/Src/Onslaught.cpp b/Onslaught/Src/Onslaught.cpp
+index 41b5022..3f9aadc 100644
+--- a/Onslaught/Src/Onslaught.cpp
++++ b/Onslaught/Src/Onslaught.cpp
+@@ -46,7 +46,7 @@ void RegisterNamesOnslaught(void)
+ }
+ 
+ 
+-#if !__STATIC_LINK
++#if !__STATIC_LINK && !defined(__EMSCRIPTEN__)
+ struct FOnslaughtInitManager
+ {
+ 	FOnslaughtInitManager()
+diff --git a/XInterface/Inc/XInterfaceClasses.h b/XInterface/Inc/XInterfaceClasses.h
+index c5a724b..4c99e08 100644
+--- a/XInterface/Inc/XInterfaceClasses.h
++++ b/XInterface/Inc/XInterfaceClasses.h
+@@ -411,6 +411,7 @@ public:
+     DECLARE_FUNCTION(execGetCurrentRes);
+     DECLARE_FUNCTION(execGetStyle);
+     DECLARE_FUNCTION(execGetMenuFont);
++    DECLARE_FUNCTION(execNotifyMenuStatus);
+     void eventValidate()
+     {
+         ProcessEvent(FindFunctionChecked(XINTERFACE_Validate),NULL);
+@@ -3805,6 +3806,7 @@ public:
+     TArrayNoInit<FString> FontArrayNames;
+     TArrayNoInit<class UFont*> FontArrayFonts;
+     DECLARE_FUNCTION(execGetFont);
++    DECLARE_FUNCTION(execGetFontB);
+     class UFont* eventGetFont(INT XRes)
+     {
+         UGUIFont_eventGetFont_Parms Parms;
+@@ -3846,6 +3848,7 @@ AUTOGENERATE_FUNCTION(UGUIStyles,-1,execTextSize);
+ AUTOGENERATE_FUNCTION(UGUIStyles,-1,execDrawText);
+ AUTOGENERATE_FUNCTION(UGUIStyles,-1,execDraw);
+ AUTOGENERATE_FUNCTION(UGUIFont,-1,execGetFont);
++AUTOGENERATE_FUNCTION(UGUIFont,-1,execGetFontB);
+ AUTOGENERATE_FUNCTION(UGUIController,-1,execGetMainMenuClass);
+ AUTOGENERATE_FUNCTION(UGUIController,-1,execCheckForECE);
+ AUTOGENERATE_FUNCTION(UGUIController,-1,execAuthroizeFirewall);
+@@ -3869,6 +3872,7 @@ AUTOGENERATE_FUNCTION(UGUIController,-1,execSetRenderDevice);
+ AUTOGENERATE_FUNCTION(UGUIController,-1,execGetCurrentRes);
+ AUTOGENERATE_FUNCTION(UGUIController,-1,execGetStyle);
+ AUTOGENERATE_FUNCTION(UGUIController,-1,execGetMenuFont);
++AUTOGENERATE_FUNCTION(UGUIController,-1,execNotifyMenuStatus);
+ AUTOGENERATE_FUNCTION(UGUIToolTip,-1,execSetTip);
+ AUTOGENERATE_FUNCTION(UGUISplitter,-1,execSplitterUpdatePositions);
+ AUTOGENERATE_FUNCTION(UGUIList,-1,execSortList);
+@@ -4081,6 +4085,7 @@ IMPLEMENT_NATIVE_HANDLER(XInterface,UGUIStyles);
+ NATIVE_INFO(UGUIFont) GXInterfaceUGUIFontNatives[] = 
+ { 
+ 	MAP_NATIVE(UGUIFont,execGetFont)
++	MAP_NATIVE(UGUIFont,execGetFontB)
+ 	{NULL,NULL}
+ };
+ IMPLEMENT_NATIVE_HANDLER(XInterface,UGUIFont);
+@@ -4110,6 +4115,7 @@ NATIVE_INFO(UGUIController) GXInterfaceUGUIControllerNatives[] =
+ 	MAP_NATIVE(UGUIController,execGetCurrentRes)
+ 	MAP_NATIVE(UGUIController,execGetStyle)
+ 	MAP_NATIVE(UGUIController,execGetMenuFont)
++	MAP_NATIVE(UGUIController,execNotifyMenuStatus)
+ 	{NULL,NULL}
+ };
+ IMPLEMENT_NATIVE_HANDLER(XInterface,UGUIController);
+diff --git a/XInterface/Src/UnGUICore.cpp b/XInterface/Src/UnGUICore.cpp
+index 8409bac..9e0b4cf 100644
+--- a/XInterface/Src/UnGUICore.cpp
++++ b/XInterface/Src/UnGUICore.cpp
+@@ -1441,6 +1441,15 @@ void UGUIController::execGetStyle(FFrame& Stack, RESULT_DECL )
+ 	unguardexec;
+ }
+ 
++void UGUIController::execNotifyMenuStatus( FFrame& Stack, RESULT_DECL )
++{
++	guard(UGUIController::execNotifyMenuStatus);
++	P_GET_UBOOL(bOpen);
++	P_GET_STR_OPTX(MenuName, TEXT(""));
++	P_FINISH;
++	unguardexec;
++}
++
+ // -- NOTE: The UGUIController always swallows input when it's active;
+ TCHAR* GetKeyStateName( BYTE State )
+ {
+@@ -2334,6 +2343,19 @@ void UGUIFont::execGetFont(FFrame& Stack, RESULT_DECL )
+ 	unguardexec;
+ }
+ 
++void UGUIFont::execGetFontB( FFrame& Stack, RESULT_DECL )
++{
++	guard(UGUIFont::execGetFontB);
++	P_GET_INT(XRes);
++	P_GET_INT(YRes);
++	P_FINISH;
++	UProperty* ParmYRes = FindField<UProperty>( GetClass(), TEXT("parm_YRes") );
++	if( ParmYRes )
++		*(INT*)((BYTE*)this + ParmYRes->Offset) = YRes;
++	*(UFont**)Result = eventGetFont( XRes );
++	unguardexec;
++}
++
+ // =======================================================================================================================================================
+ // =======================================================================================================================================================
+ // UGUIStyles

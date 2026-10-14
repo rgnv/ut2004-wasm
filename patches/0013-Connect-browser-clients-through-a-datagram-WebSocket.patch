@@ -1,0 +1,254 @@
+From b84e0b0ecbf9eabc8b98732ea070a0257522cca6 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 11:10:25 -0700
+Subject: [PATCH 13/16] Connect browser clients through a datagram WebSocket
+ transport
+
+---
+ CHANGES-wasm-port.md            | 28 +++++++++++
+ Engine/Src/UnPenLev.cpp         |  9 ++++
+ IpDrv/Src/TcpNetDriver.cpp      | 83 ++++++++++++++++++++++++++++++++-
+ Launch/Src/LaunchEmscripten.cpp | 11 ++++-
+ 4 files changed, 128 insertions(+), 3 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 036f2b5..3d30efe 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -257,3 +257,31 @@ exit=1
+   `docs/phase4-report.md`. Node regression passes full boot, mount, usage, active
+   GC, historical reachability comparison, 166 wasm objects and original hashes.
+   No websocket transport, multiplayer, audio or native-platform changes.
++
++## Phase 5 — browser multiplayer transport
++
++- `IpDrv/Src/TcpNetDriver.cpp`: under `__EMSCRIPTEN__ && UT2004_WEB_CLIENT`, replace the net driver's
++  UDP I/O with per-driver browser WebSockets. EM_JS uses the browser's native API
++  rather than SOCKFS, whose extra framing does not match the relay. Each binary
++  message is exactly one engine datagram. Queue sends while opening, copy queued
++  data before wasm memory changes, bound buffering, reject oversized/nonbinary
++  input, and close the engine connection on transport failure. Native UDP and the headless Node listen path are unchanged.
++- `Module.relayURL` selects the endpoint; default is
++  `wss://games.rgnv.dev/ut2004/connect2`. Browser page exposes `ws_url`, `connect`,
++  and `name` query parameters. After engine initialization, `connect=1` issues
++  `open 127.0.0.1?Name=<sanitized name>` through the normal engine command path.
++- `UnPenLev.cpp` logs CHALLENGE, WELCOME, and JOIN stages for wasm. Interactive
++  player telemetry includes `netMode`, allowing tests to distinguish a replicated
++  client pawn from the local startup level.
++- Transport self-check and browser/server evidence live in the wrapper repository's
++  `scripts/test-ws-transport.cjs` and `build/phase5/`.
++- Validation: Node smoke boot still exits 0 with active GC; the browser's 3369
++  session records CHALLENGE/WELCOME/JOIN, `NM_Client`, a replicated pawn, HUD,
++  W movement and mouse rotation, zero page/GL errors, and clean exit. The initial
++  W assertion failure was the login menu consuming input; focus + Escape and a
++  spawn click are required test preconditions, especially when joining an active
++  match. Browser tests use isolated systemd services after the worker-cgroup OOM.
++- Two separate systemd Chromium profiles completed simultaneous JOIN/spawn and
++  input checks. Both scoreboards show WasmOne and WasmTwo, with server-side player
++  records and clean browser exits. The isolated 3369 server/relay were removed
++  and the prior Caddy configuration restored after evidence capture.
+diff --git a/Engine/Src/UnPenLev.cpp b/Engine/Src/UnPenLev.cpp
+index 043f22a..fb4fcca 100644
+--- a/Engine/Src/UnPenLev.cpp
++++ b/Engine/Src/UnPenLev.cpp
+@@ -206,6 +206,9 @@ void UNetPendingLevel::NotifyReceivedText( UNetConnection* Connection, const TCH
+ 	}
+ 	else if( ParseCommand( &Text, TEXT("CHALLENGE") ) )
+ 	{
++#if defined(__EMSCRIPTEN__)
++        debugf(NAME_DevNet, TEXT("WASM signon: CHALLENGE received"));
++#endif
+ 		// Challenged by server.
+ 		INT RemoteStats = 0;
+ 		INT Sec=1;
+@@ -284,6 +287,9 @@ void UNetPendingLevel::NotifyReceivedText( UNetConnection* Connection, const TCH
+ 	}
+ 	else if( ParseCommand( &Text, TEXT("WELCOME") ) )
+ 	{
++#if defined(__EMSCRIPTEN__)
++        debugf(NAME_DevNet, TEXT("WASM signon: WELCOME received"));
++#endif
+ 		// Server accepted connection.
+ //		debugf( NAME_DevNet, TEXT("Welcomed by server: %s"), Text );
+ 
+@@ -376,6 +382,9 @@ void UNetPendingLevel::SendJoin()
+ {
+ 	guard(UNetPendingLevel::SendJoin);
+ 	SentJoin = 1;
++#if defined(__EMSCRIPTEN__)
++    debugf(NAME_DevNet, TEXT("WASM signon: sending JOIN"));
++#endif
+ 	NetDriver->ServerConnection->Logf( TEXT("JOIN") );
+ 	NetDriver->ServerConnection->FlushNet();
+ 	unguard;
+diff --git a/IpDrv/Src/TcpNetDriver.cpp b/IpDrv/Src/TcpNetDriver.cpp
+index ca76e81..203f71f 100644
+--- a/IpDrv/Src/TcpNetDriver.cpp
++++ b/IpDrv/Src/TcpNetDriver.cpp
+@@ -12,6 +12,59 @@ Notes:
+ 
+ #include "UnIpDrv.h"
+ #include "UnTcpNetDriver.h"
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++#include <emscripten.h>
++// Own the WebSocket per net driver; SOCKFS adds framing our UDP relay does not use.
++EM_JS(int, WasmNetOpen, (), {
++    try {
++        const ws = new WebSocket(Module.relayURL || 'wss://games.rgnv.dev/ut2004/connect2');
++        ws.binaryType = 'arraybuffer';
++        const sessions = Module.netSessions || (Module.netSessions = {});
++        const id = Module.netNextId = (Module.netNextId || 0) + 1;
++        const s = sessions[id] = {ws, incoming: [], outgoing: [], bytes: 0, failed: false, sent: 0, received: 0};
++        ws.onopen = () => {
++            console.log('WASM WS open ' + ws.url);
++            for (const data of s.outgoing) ws.send(data);
++            s.outgoing = [];
++        };
++        ws.onmessage = event => {
++            if (!(event.data instanceof ArrayBuffer) || event.data.byteLength < 1 || event.data.byteLength > 576 || s.bytes + event.data.byteLength > 1048576) {
++                s.failed = true; ws.close(1009); return;
++            }
++            s.incoming.push(new Uint8Array(event.data));
++            s.bytes += event.data.byteLength;
++            ++s.received;
++        };
++        ws.onerror = () => { s.failed = true; console.log('WASM WS error'); };
++        ws.onclose = event => { s.failed = true; console.log('WASM WS closed ' + event.code); };
++        return id;
++    } catch (error) { console.log('WASM WS create failed: ' + error); return 0; }
++});
++EM_JS(int, WasmNetSend, (int id, const void* data, int count), {
++    const s = Module.netSessions[id];
++    if (!s || s.failed || count < 0 || count > 576) return 0;
++    const packet = HEAPU8.slice(data, data + count);
++    if (s.ws.readyState === 0 && s.outgoing.length < 256) s.outgoing.push(packet);
++    else if (s.ws.readyState === 1 && s.ws.bufferedAmount < 1048576) s.ws.send(packet);
++    else { s.failed = true; return 0; }
++    ++s.sent;
++    return 1;
++});
++EM_JS(int, WasmNetReceive, (int id, void* data), {
++    const s = Module.netSessions[id];
++    if (!s || s.failed) return -1;
++    const packet = s.incoming.shift();
++    if (!packet) return 0;
++    s.bytes -= packet.length;
++    HEAPU8.set(packet, data);
++    return packet.length;
++});
++EM_JS(void, WasmNetClose, (int id), {
++    const s = Module.netSessions && Module.netSessions[id];
++    if (s) { s.ws.onmessage = null; s.ws.close(); delete Module.netSessions[id]; }
++});
++#endif
++
+ 
+ /*-----------------------------------------------------------------------------
+ 	Declarations.
+@@ -58,7 +111,11 @@ UTcpipConnection::UTcpipConnection( SOCKET InSocket, UNetDriver* InDriver, socka
+ 	InitOut();
+ 
+ 	// In connecting, figure out IP address.
+-	if( InOpenedLocally )
++	if( InOpenedLocally
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++        && 0 // Relay owns destination resolution.
++#endif
++    )
+ 	{
+ 		const TCHAR* s = *InURL.Host;
+ 		INT i;
+@@ -113,7 +170,11 @@ void UTcpipConnection::LowLevelSend( void* Data, INT Count )
+ 	}
+ 		// Send to remote.
+ 	clock(Driver->SendCycles);
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++    if (!WasmNetSend(Socket, Data, Count)) State = USOCK_Closed;
++#else
+ 	sendto( Socket, (char *)Data, Count, 0, (sockaddr*)&RemoteAddr, sizeof(RemoteAddr) );
++#endif
+ 	unclock(Driver->SendCycles);
+ 	unguard;
+ }
+@@ -197,6 +258,14 @@ void UTcpNetDriver::TickDispatch( FLOAT DeltaTime )
+ 	guard(UTcpNetDriver::TickDispatch);
+ 	Super::TickDispatch( DeltaTime );
+ 
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++    BYTE Packet[NETWORK_MAX_PACKET];
++    INT Size = 0;
++    while (ServerConnection && (Size = WasmNetReceive(Socket, Packet)) > 0)
++        ServerConnection->ReceivedRawPacket(Packet, Size);
++    if (ServerConnection && Size < 0) ServerConnection->State = USOCK_Closed;
++    return;
++#endif
+ 	FLOAT TCPNetDriverTime = 0.f;
+ 	clock(TCPNetDriverTime);
+ 	// Process all incoming packets.
+@@ -341,6 +410,11 @@ void UTcpNetDriver::LowLevelDestroy()
+ {
+ 	guard(UTcpNetDriver::LowLevelDestroy);
+ 
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++    if (Socket) WasmNetClose(Socket);
++    Socket = 0;
++    return;
++#endif
+ 	// Close the socket.
+ 	if( Socket )
+ 	{
+@@ -362,6 +436,13 @@ UBOOL UTcpNetDriver::InitBase( UBOOL Connect, FNetworkNotify* InNotify, FURL& UR
+ 	if( !InitSockets( Error ) )
+ 		return 0;
+ 
++#if defined(__EMSCRIPTEN__) && defined(UT2004_WEB_CLIENT)
++    if (!Connect) { Error = TEXT("WASM WebSocket transport is client-only"); return 0; }
++    appMemzero(&LocalAddr, sizeof(LocalAddr));
++    Socket = WasmNetOpen();
++    if (!Socket) { Error = TEXT("WebSocket creation failed"); return 0; }
++    return 1;
++#endif
+ 	// Create UDP socket and enable broadcasting.
+ 	Socket = socket( AF_INET, SOCK_DGRAM, IPPROTO_UDP );
+ 	if( Socket == INVALID_SOCKET )
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index d17ca49..17bb6fc 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -86,6 +86,7 @@ int main(int argc, char** argv)
+ #endif
+     FName(NAME_Init).ClearFlags(RF_Suppress);
+     FName(NAME_DevLoad).ClearFlags(RF_Suppress);
++    FName(NAME_DevNet).ClearFlags(RF_Suppress);
+     debugf(NAME_Init, TEXT("WASM: Core init complete"));
+     char CorePath[512];
+     snprintf(CorePath, sizeof(CorePath), "%s/Core.so", BaseEnv);
+@@ -119,6 +120,11 @@ int main(int argc, char** argv)
+         Engine->Init();
+         debugf(NAME_Init, TEXT("WASM: engine initialized"));
+ #if defined(UT2004_WEB_CLIENT)
++        if (EM_ASM_INT({ return Module.connect ? 1 : 0; })) {
++            char Name[64];
++            EM_ASM({ stringToUTF8((Module.playerName || 'WasmPlayer').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48), $0, $1); }, Name, sizeof(Name));
++            Engine->Exec(*FString::Printf(TEXT("open 127.0.0.1?Name=%s"), Name), *GLog);
++        }
+         GIsRunning = 1;
+         INT Frame = 0;
+         DOUBLE Previous = appSeconds();
+@@ -139,10 +145,11 @@ int main(int argc, char** argv)
+             if (Interactive && Engine->Client && Engine->Client->Viewports.Num())
+             {
+                 APlayerController* Player = Engine->Client->Viewports(0)->Actor;
++                if (!Player) continue;
+                 AActor* Target = Player->Pawn ? (AActor*)Player->Pawn : (AActor*)Player;
+-                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7}); },
++                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7, netMode: $8}); },
+                     Frame, Target->Location.X, Target->Location.Y, Target->Location.Z,
+-                    Player->Rotation.Pitch, Player->Rotation.Yaw, Player->Rotation.Roll, Player->Pawn != NULL);
++                    Player->Rotation.Pitch, Player->Rotation.Yaw, Player->Rotation.Roll, Player->Pawn != NULL, Player->Level->NetMode);
+             }
+         }
+         GIsRunning = 0;
+-- 
+2.47.3
+

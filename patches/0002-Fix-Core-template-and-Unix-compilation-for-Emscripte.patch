@@ -1,0 +1,420 @@
+From 41ba865d7575f316444ed830ebbaf5363cdc9019 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 08:09:33 -0700
+Subject: [PATCH 02/16] Fix Core template and Unix compilation for Emscripten
+
+---
+ CHANGES-wasm-port.md  |  21 ++++++++
+ Core/Inc/UnClass.h    | 117 ++++++++++++++++++++++++++++++++++++++++++
+ Core/Inc/UnGnuG.h     |  11 ++++
+ Core/Inc/UnMem.h      |  12 +++++
+ Core/Inc/UnName.h     |   3 ++
+ Core/Inc/UnObjBas.h   |  17 +++++-
+ Core/Inc/UnTemplate.h |  12 +++++
+ Core/Src/UnArc.cpp    |   2 +-
+ Core/Src/UnUnix.cpp   |   9 +++-
+ 9 files changed, 199 insertions(+), 5 deletions(-)
+ create mode 100644 CHANGES-wasm-port.md
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+new file mode 100644
+index 0000000..3f4bc4a
+--- /dev/null
++++ b/CHANGES-wasm-port.md
+@@ -0,0 +1,21 @@
++# WebAssembly compile port changes
++
++Baseline: `ec2638b` already contains Emscripten platform types, C rotate/timer fallbacks, guarded size typedef and GNUSTATIC fix. Native platform branches remain unchanged by this phase.
++
++## Core compilation
++
++- `Core/Inc/UnTemplate.h`, array placement new: omit premature explicit `FString` instantiation on Emscripten; instantiate at complete-type use sites.
++- `Core/Inc/UnTemplate.h`, `TTransArray`, `TLazyArray`, `TMultiMap`: Emscripten-only base-member using declarations resolve Clang two-phase lookup without changing operations.
++- `Core/Inc/UnObjBas.h`, `FlagCast`; `Core/Inc/UnClass.h`, field iterators: defer Emscripten definitions until `UClass`/`UStruct` are complete; retain native definition locations.
++- `Core/Inc/UnObjBas.h`, `ConstructObject`: Emscripten-only base pointer cast permits forward-declared `UPackage`; inheritance and pointer value unchanged.
++- `Core/Inc/UnMem.h`, `FMemStack` placement new: move Emscripten default arguments from friend declarations to namespace declarations; allocation unchanged.
++- `Core/Inc/UnGnuG.h`, platform includes: include stdio on Emscripten for `GET_VARARGS`/`vsnprintf` declarations.
++- `Core/Inc/UnName.h`, `AllocateNameEntry`: expose namespace declaration on Emscripten for calls with null arguments that cannot find hidden friend via ADL.
++- `Core/Src/UnArc.cpp`, `operator<<(UNICHAR&)`: omit duplicate Emscripten overload when `UNICHAR` aliases `_WORD`; existing overload serializes identical bytes.
++- `Core/Src/UnUnix.cpp`, stack trace feature detection: use existing no-execinfo path on Emscripten, whose libc has no `execinfo.h`; native behavior unchanged.
++- `Core/Src/UnUnix.cpp`, includes: omit unused Vorbis headers on Emscripten; this translation unit references no Vorbis APIs.
++- `Core/Src/UnUnix.cpp`, `appPlatformPreInit`: identify Emscripten with existing `OS_UNKNOWN` enum and descriptive machine string instead of platform `#error`.
++- `Core/Inc/UnObjBas.h`, `IMPLEMENT_CLASS`: qualify package global on Emscripten so inherited `Engine` members cannot shadow module package name; native expansion unchanged.
++- `Core/Inc/UnGnuG.h`, `unixToANSI`: add Emscripten ANSI-build identity-copy overload (including existing null-to-empty behavior) and string declaration; Unix file manager previously exposed only Unicode conversion.
++
++Core validation: all 20 objects rebuilt successfully. `llvm-nm --undefined-only --demangle` finds no unresolved `operator new` for `TArray<FString>`; full linking remains outside scope. ANSI-copy self-check passed normal, empty, null input and return-pointer cases.
+diff --git a/Core/Inc/UnClass.h b/Core/Inc/UnClass.h
+index 76b545c..c784bc9 100644
+--- a/Core/Inc/UnClass.h
++++ b/Core/Inc/UnClass.h
+@@ -138,6 +138,7 @@ class CORE_API UField : public UObject
+ //
+ // For iterating through a linked list of fields.
+ //
++#if !defined(__EMSCRIPTEN__)
+ template <class T> class TFieldIterator
+ {
+ public:
+@@ -244,6 +245,8 @@ protected:
+ 	UField* Field;
+ };
+ 
++#endif
++
+ /*-----------------------------------------------------------------------------
+ 	UStruct.
+ -----------------------------------------------------------------------------*/
+@@ -620,6 +623,120 @@ class CORE_API UConst : public UField
+ 	}
+ };
+ 
++#if defined(__EMSCRIPTEN__)
++template< class T, EClassFlags Flag > T* FlagCast( UObject* Src ) // sjs
++{
++	return Src && (Src->GetClass()->ClassFlags & Flag) ? (T*)Src : NULL;
++}
++
++template <class T> class TFieldIterator
++{
++public:
++	TFieldIterator( UStruct* InStruct )
++	: Struct( InStruct )
++	, Field( InStruct ? InStruct->Children : NULL )
++	{
++		IterateToNext();
++	}
++	operator UBOOL()
++	{
++		return Field != NULL;
++	}
++	void operator++()
++	{
++		checkSlow(Field);
++		Field = Field->Next;
++		IterateToNext();
++	}
++	T* operator*()
++	{
++		checkSlow(Field);
++		return (T*)Field;
++	}
++	T* operator->()
++	{
++		checkSlow(Field);
++		return (T*)Field;
++	}
++	UStruct* GetStruct()
++	{
++		return Struct;
++	}
++protected:
++	void IterateToNext()
++	{
++		while( Struct )
++		{
++			while( Field )
++			{
++				if( Field->IsA(T::StaticClass()) )
++					return;
++				Field = Field->Next;
++			}
++			Struct = Struct->GetInheritanceSuper();
++			if( Struct )
++				Field = Struct->Children;
++		}
++	}
++	UStruct* Struct;
++	UField* Field;
++};
++
++template <class T, EClassFlags Flag> class TFieldFlagIterator // sjs
++{
++public:
++	TFieldFlagIterator( UStruct* InStruct )
++	: Struct( InStruct )
++	, Field( InStruct ? InStruct->Children : NULL )
++	{
++		IterateToNext();
++	}
++	inline operator UBOOL()
++	{
++		return Field != NULL;
++	}
++	inline void operator++()
++	{
++		checkSlow(Field);
++		Field = Field->Next;
++		IterateToNext();
++	}
++	inline T* operator*()
++	{
++		checkSlow(Field);
++		return (T*)Field;
++	}
++	inline T* operator->()
++	{
++		checkSlow(Field);
++		return (T*)Field;
++	}
++	inline UStruct* GetStruct()
++	{
++		return Struct;
++	}
++protected:
++	inline void IterateToNext()
++	{
++		while( Struct )
++		{
++			while( Field )
++			{
++                if( (Field->GetClass()->ClassFlags & Flag) )
++                    return;
++				Field = Field->Next;
++			}
++			Struct = Struct->GetInheritanceSuper();
++			if( Struct )
++				Field = Struct->Children;
++		}
++	}
++	UStruct* Struct;
++	UField* Field;
++};
++
++#endif
++
+ #include "UnForcePacking_end.h"
+ 
+ /*-----------------------------------------------------------------------------
+diff --git a/Core/Inc/UnGnuG.h b/Core/Inc/UnGnuG.h
+index 7633e51..b97a0a0 100644
+--- a/Core/Inc/UnGnuG.h
++++ b/Core/Inc/UnGnuG.h
+@@ -92,6 +92,11 @@
+ // alloca
+ #include <stdlib.h>
+ 
++#if defined(__EMSCRIPTEN__)
++#include <stdio.h> // vsnprintf used by GET_VARARGS.
++#include <string.h>
++#endif
++
+ // va_list
+ #include <stdarg.h>
+ 
+@@ -289,6 +294,12 @@ typedef unsigned int size_t;
+ #define TCHAR_CALL_OS(funcW,funcA) (funcA)
+ #define TCHAR_TO_ANSI(str) str
+ #define ANSI_TO_TCHAR(str) str
++#if defined(__EMSCRIPTEN__)
++inline ANSICHAR* unixToANSI( ANSICHAR* Dest, const ANSICHAR* Src )
++{
++	return strcpy(Dest, Src ? Src : "");
++}
++#endif
+ 
+ #else
+ 
+diff --git a/Core/Inc/UnMem.h b/Core/Inc/UnMem.h
+index 28bc8cf..94f828a 100644
+--- a/Core/Inc/UnMem.h
++++ b/Core/Inc/UnMem.h
+@@ -61,9 +61,15 @@ public:
+ 
+ 	// Friends.
+ 	friend class FMemMark;
++#if defined(__EMSCRIPTEN__)
++	friend void* operator new( size_t Size, FMemStack& Mem, INT Count, INT Align );
++	friend void* operator new( size_t Size, FMemStack& Mem, EMemZeroed Tag, INT Count, INT Align );
++	friend void* operator new( size_t Size, FMemStack& Mem, EMemOned Tag, INT Count, INT Align );
++#else
+ 	friend void* operator new( size_t Size, FMemStack& Mem, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
+ 	friend void* operator new( size_t Size, FMemStack& Mem, EMemZeroed Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
+ 	friend void* operator new( size_t Size, FMemStack& Mem, EMemOned Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
++#endif
+ 
+ 	// Types.
+ 	struct FTaggedMemory
+@@ -95,6 +101,12 @@ private:
+ 	FMemStack templates.
+ -----------------------------------------------------------------------------*/
+ 
++#if defined(__EMSCRIPTEN__)
++void* operator new( size_t Size, FMemStack& Mem, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
++void* operator new( size_t Size, FMemStack& Mem, EMemZeroed Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
++void* operator new( size_t Size, FMemStack& Mem, EMemOned Tag, INT Count=1, INT Align=DEFAULT_ALIGNMENT );
++#endif
++
+ // Operator new for typesafe memory stack allocation.
+ template <class T> inline T* New( FMemStack& Mem, INT Count=1, INT Align=DEFAULT_ALIGNMENT )
+ {
+diff --git a/Core/Inc/UnName.h b/Core/Inc/UnName.h
+index 20f05ec..4f64cb5 100644
+--- a/Core/Inc/UnName.h
++++ b/Core/Inc/UnName.h
+@@ -49,6 +49,9 @@ struct CORE_API FNameEntry
+ 	CORE_API friend FArchive& operator<<( FArchive& Ar, FNameEntry& E );
+ 	CORE_API friend FNameEntry* AllocateNameEntry( const TCHAR* Name, DWORD Index, DWORD Flags, FNameEntry* HashNext );
+ };
++#if defined(__EMSCRIPTEN__)
++CORE_API FNameEntry* AllocateNameEntry( const TCHAR* Name, DWORD Index, DWORD Flags, FNameEntry* HashNext );
++#endif
+ template <> struct TTypeInfo<FNameEntry*> : public TTypeInfoBase<FNameEntry*>
+ {
+ 	static UBOOL NeedsDestructor() {return 0;}
+diff --git a/Core/Inc/UnObjBas.h b/Core/Inc/UnObjBas.h
+index 0ef0e50..12ca2c9 100644
+--- a/Core/Inc/UnObjBas.h
++++ b/Core/Inc/UnObjBas.h
+@@ -433,6 +433,11 @@ public: \
+ 	TWithinClass* GetOuter##TWithinClass() const { return (TWithinClass*)GetOuter(); }
+ 
+ // Register a class at startup time.
++#if defined(__EMSCRIPTEN__)
++#define IMPLEMENT_CLASS_PACKAGE ::GPackage
++#else
++#define IMPLEMENT_CLASS_PACKAGE GPackage
++#endif
+ 
+ #if __STATIC_LINK
+ 	#define IMPLEMENT_CLASS(TClass) \
+@@ -481,7 +486,7 @@ public: \
+ 			TClass::WithinClass::StaticClass(), \
+ 			FGuid(TClass::GUID1,TClass::GUID2,TClass::GUID3,TClass::GUID4), \
+ 			TEXT(#TClass)+1, \
+-			GPackage, \
++			IMPLEMENT_CLASS_PACKAGE, \
+ 			StaticConfigName(), \
+ 			RF_Public | RF_Standalone | RF_Transient | RF_Native, \
+ 			(void(*)(void*))&TClass::InternalConstructor, \
+@@ -500,7 +505,7 @@ public: \
+ 			TClass::WithinClass::StaticClass(), \
+ 			FGuid(TClass::GUID1,TClass::GUID2,TClass::GUID3,TClass::GUID4), \
+ 			TEXT(#TClass)+1, \
+-			GPackage, \
++			IMPLEMENT_CLASS_PACKAGE, \
+ 			StaticConfigName(), \
+ 			RF_Public | RF_Standalone | RF_Transient | RF_Native, \
+ 			(void(*)(void*))TClass::InternalConstructor, \
+@@ -1238,17 +1243,25 @@ template< class T, class U > T* CastChecked( U* Src )
+ 		appErrorf( TEXT("Cast of %s to %s failed"), Src ? Src->GetFullName() : TEXT("NULL"), T::StaticClass()->GetName() );
+ 	return (T*)Src;
+ }
++#if defined(__EMSCRIPTEN__)
++template< class T, EClassFlags Flag > T* FlagCast( UObject* Src );
++#else
+ template< class T, EClassFlags Flag > T* FlagCast( UObject* Src ) // sjs
+ {
+ 	return Src && (Src->GetClass()->ClassFlags & Flag) ? (T*)Src : NULL;
+ }
++#endif
+ 
+ // Construct an object of a particular class.
+ template< class T > T* ConstructObject( UClass* Class, UObject* Outer=(UObject*)-1, FName Name=NAME_None, DWORD SetFlags=0 )
+ {
+ 	check(Class->IsChildOf(T::StaticClass()));
+ 	if( Outer==(UObject*)-1 )
++#if defined(__EMSCRIPTEN__)
++		Outer = (UObject*)UObject::GetTransientPackage();
++#else
+ 		Outer = UObject::GetTransientPackage();
++#endif
+ 	return (T*)UObject::StaticConstructObject( Class, Outer, Name, SetFlags );
+ }
+ 
+diff --git a/Core/Inc/UnTemplate.h b/Core/Inc/UnTemplate.h
+index 850e474..64da3cc 100644
+--- a/Core/Inc/UnTemplate.h
++++ b/Core/Inc/UnTemplate.h
+@@ -800,7 +800,9 @@ template <class T> GNUSTATIC inline void* operator new( size_t Size, TArray<T>&
+ #undef GNUSTATIC
+ 
+ 
++#if !defined(__EMSCRIPTEN__)
+ template void* operator new( size_t Size, TArray<FString>& Array );
++#endif
+ 
+ 
+ //
+@@ -820,6 +822,9 @@ template <class T> inline void ExchangeArray( TArray<T>& A, TArray<T>& B )
+ template< class T > class TTransArray : public TArray<T>
+ {
+ public:
++#if defined(__EMSCRIPTEN__)
++	using TArray<T>::Num;
++#endif
+ 	// Constructors.
+ 	TTransArray( UObject* InOwner, INT InNum=0 )
+ 	:	TArray<T>( InNum )
+@@ -1022,6 +1027,9 @@ public:
+ template <class T> class TLazyArray : public TArray<T>, public FLazyLoader
+ {
+ public:
++#if defined(__EMSCRIPTEN__)
++	using TArray<T>::Empty;
++#endif
+ 	TLazyArray( INT InNum=0 )
+ 	: TArray<T>( InNum )
+ 	, FLazyLoader()
+@@ -2068,6 +2076,10 @@ public:
+ template< class TK, class TI > class TMultiMap : public TMapBase<TK,TI>
+ {
+ public:
++#if defined(__EMSCRIPTEN__)
++	using TMapBase<TK,TI>::Pairs;
++	using TMapBase<TK,TI>::Relax;
++#endif
+ 	TMultiMap& operator=( const TMultiMap& Other )
+ 	{
+ 		TMapBase<TK,TI>::operator=( Other );
+diff --git a/Core/Src/UnArc.cpp b/Core/Src/UnArc.cpp
+index 8f49d07..dcc21f2 100644
+--- a/Core/Src/UnArc.cpp
++++ b/Core/Src/UnArc.cpp
+@@ -89,7 +89,7 @@ CORE_API FArchive& operator<<( FArchive& Ar, PTRINT& P )
+ #endif
+ 
+ 
+-#ifdef __GNUC__
++#if defined(__GNUC__) && (!defined(__EMSCRIPTEN__) || (defined(UNICODE) && !defined(NO_UNICODE_OS_SUPPORT)))
+ CORE_API FArchive& operator<<( FArchive& Ar, UNICHAR& C )
+ {
+ 	Ar.ByteOrderSerialize( &C, sizeof(C) );
+diff --git a/Core/Src/UnUnix.cpp b/Core/Src/UnUnix.cpp
+index 4cdbe85..5db8ed7 100644
+--- a/Core/Src/UnUnix.cpp
++++ b/Core/Src/UnUnix.cpp
+@@ -49,7 +49,7 @@
+ #endif
+ 
+ // Stack traces via C runtime...
+-#if ((MACOSX) || (__FreeBSD__))
++#if ((MACOSX) || (__FreeBSD__) || defined(__EMSCRIPTEN__))
+ #  define HAVE_EXECINFO_H 0
+ #else
+ #  define HAVE_EXECINFO_H 1
+@@ -215,8 +215,10 @@ extern "C"
+ 
+ #endif
+ 
++#if !defined(__EMSCRIPTEN__)
+ #include "vorbis/codec.h"
+ #include "vorbis/vorbisfile.h"
++#endif
+ 
+ /*-----------------------------------------------------------------------------
+ 	Globals
+@@ -2152,7 +2154,10 @@ void appPlatformPreInit()
+     unixDetectUNICODE();
+ #endif
+ 
+-#if __LINUX_X86__
++#if defined(__EMSCRIPTEN__)
++    GRunningOS = OS_UNKNOWN;
++    appSprintf(GMachineOS, TEXT("WebAssembly (Emscripten)"));
++#elif __LINUX_X86__
+     #ifdef __x86_64__
+         GRunningOS = OS_LINUX_X86_64;
+         appSprintf(GMachineOS, TEXT("x86-64 Linux"));
+-- 
+2.47.3
+

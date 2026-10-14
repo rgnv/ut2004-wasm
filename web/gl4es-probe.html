@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GL4ES compatibility probe — not UT2004 rendering</title>
+<link rel="icon" href="data:,">
+<h1>GL4ES compatibility probe</h1>
+<p>Fixed-function triangle and UT2004 symbol lookup. Engine rendering not integrated.</p>
+<canvas id="canvas" width="640" height="480"></canvas>
+<script>
+window.bootResult = null;
+var Module = {
+  canvas: document.getElementById('canvas'),
+  print: text => console.log(text),
+  printErr: text => console.log(text),
+  onExit: code => { window.bootResult = {type: 'exit', code}; },
+  onAbort: reason => { window.bootResult = {type: 'abort', reason: String(reason)}; }
+};
+</script>
+<script src="gl4es-probe.js"></script>

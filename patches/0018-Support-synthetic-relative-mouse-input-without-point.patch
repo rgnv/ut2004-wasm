@@ -1,0 +1,72 @@
+From 4a44551dedd93793af7f69fe5a6aa0def5681356 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 22:48:41 -0700
+Subject: [PATCH 18/21] Support synthetic relative mouse input without pointer
+ lock
+
+---
+ CHANGES-wasm-port.md                            | 14 ++++++++++++++
+ SDL/src/video/emscripten/SDL_emscriptenevents.c |  7 +++++--
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 1682e84..f3926b1 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -375,3 +375,17 @@ exit=1
+   pass; no page/GL/WebGL errors. Headless pve rejects unadjustedMovement with
+   NotSupportedError, exercising the logged fallback; hardware raw input is not
+   claimed. Full evidence and failed iteration history remain in `build/phase9/`.
++
++## Mobile input phase 1
++
++- Emscripten SDL pointer adapter accepts the shared kit's explicit synthetic
++  relative flag. Touch/controller look uses movementX/Y without browser pointer
++  lock or canvas-edge clipping; synthetic button presses do not request a lock.
++  Physical pointer events keep their existing path. The C struct and JS writer
++  grow together; the flag is initialized for every pointer event.
++- No joystick or audio behavior changes. SDL joystick support remains compiled,
++  while the wrapper maps standard Gamepad API input to the shipped keyboard,
++  mouse, and wheel bindings. Engine command line still includes `-nosound`.
++- Wrapper sources: `web/mobile/mobile-input.{js,css}`, `web/index.html`.
++  Verification: wrapper `scripts/test-mobile-kit.cjs`, `scripts/test-mobile1.cjs`,
++  and `scripts/test-web.cjs --interactive`; evidence in `build/mobile1/`.
+diff --git a/SDL/src/video/emscripten/SDL_emscriptenevents.c b/SDL/src/video/emscripten/SDL_emscriptenevents.c
+index 7ebfd24..e4ecad2 100644
+--- a/SDL/src/video/emscripten/SDL_emscriptenevents.c
++++ b/SDL/src/video/emscripten/SDL_emscriptenevents.c
+@@ -628,6 +628,7 @@ typedef struct Emscripten_PointerEvent
+     float tiltx;
+     float tilty;
+     float rotation;
++    bool synthetic_relative;
+ } Emscripten_PointerEvent;
+ 
+ static void Emscripten_HandleMouseButton(SDL_WindowData *window_data, const Emscripten_PointerEvent *event)
+@@ -650,7 +651,7 @@ static void Emscripten_HandleMouseButton(SDL_WindowData *window_data, const Emsc
+         SDL_assert(mouse != NULL);
+ 
+         if (down) {
+-            if (mouse->relative_mode && !window_data->has_pointer_lock) {
++            if (mouse->relative_mode && !window_data->has_pointer_lock && !event->synthetic_relative) {
+                 Emscripten_RequestRawPointerLock(); // Regrab uses the same raw request as initial lock.
+             }
+         }
+@@ -685,7 +686,7 @@ static void Emscripten_UpdateMouseFromEvent(SDL_WindowData *window_data, const E
+     const double xscale = window_data->window->w / client_w;
+     const double yscale = window_data->window->h / client_h;
+ 
+-    const bool isPointerLocked = window_data->has_pointer_lock;
++    const bool isPointerLocked = window_data->has_pointer_lock || event->synthetic_relative;
+     float mx, my;
+     if (isPointerLocked) {
+         mx = event->movementX;
+@@ -943,6 +944,8 @@ static void Emscripten_prep_pointer_event_callbacks(void)
+                     HEAPF32[idx++] = event.movementY;
+                     HEAPF32[idx++] = event.clientX - left;
+                     HEAPF32[idx++] = event.clientY - top;
++                    // Shared mobile kit supplies relative mouse motion without browser pointer lock.
++                    HEAPU8[ptr + 52] = event.mobileInputRelative === true;
+                     if (ptrtype == 3) {
+                         HEAPF32[idx++] = event.pressure;
+                         HEAPF32[idx++] = event.tangentialPressure;

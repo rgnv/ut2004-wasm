@@ -1,0 +1,58 @@
+From b0a3d106d8ea3ed1a1ebfac538b45300538c948b Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 16:12:08 -0700
+Subject: [PATCH 15/16] Verify browser Fire native exports after linking the
+ real texture module
+
+---
+ CHANGES-wasm-port.md            | 16 ++++++++++++++++
+ Launch/Src/LaunchEmscripten.cpp |  9 +++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index ba46700..a41a20a 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -305,3 +305,19 @@ exit=1
+ - Performance target failed: final pve cold first frame 106.0 s versus 52.1 s
+   baseline; full-file prefetch increased startup traffic to 2.07 GB. See wrapper
+   `docs/phase7-report.md` for measurements and current multiplayer map limitations.
++
++## Phase 7b — restore demand reads and link Fire natives
++
++- Browser wrapper restores the phase-6 1 MiB lazy range filesystem and original
++  Asyncify `fd_read` override; whole-file prefetch and its 160 MiB cache are removed.
++- Browser link includes existing `Fire/Src/UnFractal.cpp` and passes `Fire` to
++  `wasm-registry.py`. The generator discovers all seven actual class exports.
++  No fake class aliases, no-op textures, or native-platform changes are needed.
++- Browser startup checks all seven Fire exports. The former link omitted Fire,
++  so `UClass::Bind` could not resolve `autoclassUFractalTexture` when Osiris2's
++  imported packages loaded `Fire.u`.
++- Wrapper `scripts/test-map-live.cjs` binds F8 in the test client's User.ini to
++  open DM-DE-Osiris2, asserts play/spawn/render/clean exit, and separately tests
++  joining the persistent server. No server travel or restart is performed.
++- Exact results, before/after logs, screenshots and cold/warm 640/1280 live-site
++  measurements are in wrapper `build/phase7b/`; see `docs/phase7b-report.md`.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 17bb6fc..ea3f2bb 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -94,6 +94,15 @@ int main(int argc, char** argv)
+     if (!CoreModule || !appGetDllExport(CoreModule, TEXT("autoclassUObject")) ||
+         appGetDllExport(CoreModule, TEXT("missing_export")) || appGetDllHandle(TEXT("missing_module.so")))
+         appErrorf(TEXT("WASM static registry self-check failed"));
++#if defined(UT2004_WEB_CLIENT)
++    void* FireModule = appGetDllHandle(TEXT("Fire.so"));
++    const TCHAR* FireExports[] = { TEXT("autoclassUFractalTexture"), TEXT("autoclassUFireTexture"),
++        TEXT("autoclassUWaterTexture"), TEXT("autoclassUWaveTexture"), TEXT("autoclassUFluidTexture"),
++        TEXT("autoclassUWetTexture"), TEXT("autoclassUIceTexture") };
++    for (INT I = 0; I < 7; ++I)
++        if (!FireModule || !appGetDllExport(FireModule, FireExports[I]))
++            appErrorf(TEXT("WASM Fire registry self-check failed: %s"), FireExports[I]);
++#endif
+     debugf(NAME_Init, TEXT("WASM: static registry self-check passed"));
+     if (MountOnly)
+     {
+-- 
+2.47.3
+
