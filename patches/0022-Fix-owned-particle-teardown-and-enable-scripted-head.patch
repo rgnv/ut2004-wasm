@@ -1,0 +1,164 @@
+From c00936de50dde33b9e74085fe00578cb5f0961b4 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Wed, 14 Oct 2026 10:07:54 -0700
+Subject: [PATCH 22/26] Fix owned particle teardown and enable scripted
+ headless map coverage
+
+---
+ CHANGES-wasm-port.md            | 22 ++++++++++++++++++
+ Engine/Src/UnParticleSystem.cpp | 30 ++++++++++++++++++++----
+ Launch/Src/LaunchEmscripten.cpp | 41 +++++++++++++++++++++++++++++----
+ 3 files changed, 84 insertions(+), 9 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 81be48f..8714332 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -573,3 +573,25 @@ launcher under Emscripten instead of a pre-runtime global constructor.
+   treating a map-loading screenshot as a ready frame. This prevents its
+   five-second resize fallback from reloading during asynchronous map loading.
+ - Editor.TransBuffer remains an explicit, nonfatal editor-only import warning.
++
++## Phase 13 — exhaustive map execution
++
++- Headless startup accepts `UT2004_MAP` (map URL, including `?game=Package.Class`),
++  enables UnrealScript like the browser and native launcher, and starts a real
++  match through `NumBots`, `MinPlayers`, and `QuickStart` URL options.
++  `UT2004_HEADLESS_BOTS` defaults to 2 (0–32); `UT2004_HEADLESS_TICKS` defaults to
++  120 (1–10000). `WASM_HEADLESS_PROOF` records the actual map/game, possessed
++  bot pawns and controlled non-vehicle pawns (including scripted tutorial actors).
++- `AEmitter::PostScriptDestroyed` now frees actor-owned particle emitters even
++  for statically loaded actors with `DeleteParticleEmitters == 0`. Previously,
++  stripped actor Emitter311 left SpriteEmitter1 registered with a dangling Outer
++  on 3369 DOM-UCMP-Cerebral, crashing garbage collection at exit.
++  CTF-UCMP2-Enlightenment also retained owned children absent from its Emitters
++  array. Static-actor teardown now visits material and emitter ownership in two
++  registry passes, not a nested scan per child. Dynamic emitters retain the
++  original list-based cleanup; package-owned shared objects remain untouched.
++  Focused verification on both maps: two bot pawns, 600 ticks, exit 0, GC enabled.
++- Browser startup accepts the shell's optional local `gameClass` without changing
++  the engine's default map-to-game selection.
++- Raw census and teardown evidence: wrapper `build/phase13/`; coverage and
++  remaining acceptance results are documented in wrapper `docs/phase13-report.md`.
+diff --git a/Engine/Src/UnParticleSystem.cpp b/Engine/Src/UnParticleSystem.cpp
+index d33133a..f8d8828 100644
+--- a/Engine/Src/UnParticleSystem.cpp
++++ b/Engine/Src/UnParticleSystem.cpp
+@@ -106,18 +106,38 @@ void AEmitter::Spawned()
+ void AEmitter::PostScriptDestroyed()
+ {
+ 	guard(AEMitter::Destroy);
+-#if 1
+ 	if( DeleteParticleEmitters )
+ 	{
+-		for (INT i=0; i<Emitters.Num(); i++)
++		delete ParticleMaterial;
++		ParticleMaterial = NULL;
++		for( INT i=0; i<Emitters.Num(); i++ )
+ 		{
+ 			delete Emitters(i);
+ 			Emitters(i) = NULL;
+ 		}
+-		delete ParticleMaterial;
+-		ParticleMaterial = NULL;
+ 	}
+-#endif
++	else
++	{
++		// Static maps can retain owned subobjects absent from Emitters. Release
++		// materials first, while their emitter Outers are still alive.
++		for( TObjectIterator<UParticleMaterial> It; It; ++It )
++		{
++			UParticleMaterial* Material = *It;
++			UObject* Owner = Material->GetOuter();
++			if( Owner==this || (Owner && Owner->IsA(UParticleEmitter::StaticClass()) && Owner->GetOuter()==this) )
++			{
++				if( ParticleMaterial==Material )
++					ParticleMaterial = NULL;
++				delete Material;
++			}
++		}
++		for( INT i=0; i<Emitters.Num(); i++ )
++			if( Emitters(i) && Emitters(i)->GetOuter()==this )
++				Emitters(i) = NULL;
++		for( TObjectIterator<UParticleEmitter> It; It; ++It )
++			if( It->GetOuter()==this )
++				delete *It;
++	}
+ 	Super::PostScriptDestroyed();
+ 	unguard;
+ }
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 01aa535..2e5d22c 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -77,7 +77,7 @@ int main(int argc, char** argv)
+     const UBOOL Splash = EM_ASM_INT({ return Module.splash ? 1 : 0; });
+     const UBOOL NoSound = EM_ASM_INT({ return Module.noSound ? 1 : 0; });
+     char Map[256];
+-    EM_ASM({ stringToUTF8(Module.map || 'DM-Rankin', $0, $1); }, Map, sizeof(Map));
++    EM_ASM({ stringToUTF8((Module.map || 'DM-Rankin') + (Module.gameClass ? '?game=' + Module.gameClass : ''), $0, $1); }, Map, sizeof(Map));
+     const UBOOL LocalMap = EM_ASM_INT({ return Module.localMap ? 1 : 0; });
+     char BrowserCommandLine[320];
+     snprintf(BrowserCommandLine, sizeof(BrowserCommandLine), "%s?NumBots=%i -nohomedir%s",
+@@ -85,13 +85,22 @@ int main(int argc, char** argv)
+     const TCHAR* CommandLine = Interactive && !Splash ? BrowserCommandLine
+         : (Interactive && !NoSound ? TEXT("-nohomedir") : TEXT("-nohomedir -nosound"));
+ #else
+-    const TCHAR* CommandLine = TEXT("-nohomedir -nosound");
++    const char* MapEnv = getenv("UT2004_MAP");
++    const char* BotsEnv = getenv("UT2004_HEADLESS_BOTS");
++    const char* TicksEnv = getenv("UT2004_HEADLESS_TICKS");
++    const INT Bots = BotsEnv && BotsEnv[0] ? Clamp(atoi(BotsEnv), 0, 32) : 2;
++    char NodeCommandLine[1024];
++    // Use game options that exercise normal match startup and player filling.
++    snprintf(NodeCommandLine, sizeof(NodeCommandLine), "%s?NumBots=%d?MinPlayers=%d?QuickStart=1 -nohomedir -nosound",
++        MapEnv && MapEnv[0] ? MapEnv : "DM-Rankin", Bots, Bots);
++    const INT HeadlessTicks = TicksEnv && TicksEnv[0] ? Clamp(atoi(TicksEnv), 1, 10000) : 120;
++    const TCHAR* CommandLine = NodeCommandLine;
+ #endif
+     appInit(TEXT("UT2004"), CommandLine, &Malloc, &Log, &Error, &Warn, &Files, FConfigCacheIni::Factory, 1);
+     RegisterNamesOnslaught();
+     RegisterNamesXInterface();
+-#if defined(UT2004_WEB_CLIENT)
+     GIsScriptable = 1;
++#if defined(UT2004_WEB_CLIENT)
+     GConfig->SetString(TEXT("Engine.Engine"), TEXT("ViewportManager"), TEXT("SDLDrv.SDLClient"));
+     GConfig->SetString(TEXT("Engine.Engine"), TEXT("RenderDevice"), TEXT("OpenGLDrv.OpenGLRenderDevice"));
+     GConfig->SetBool(TEXT("SDLDrv.SDLClient"), TEXT("StartupFullscreen"), 0);
+@@ -235,7 +244,31 @@ int main(int argc, char** argv)
+         GIsRunning = 0;
+         debugf(NAME_Init, TEXT("WASM: browser ticks=%i"), Frame);
+ #else
+-        for (INT Frame = 0; Frame < 3 && !GIsRequestingExit; ++Frame) Engine->Tick(1.0f / 60.0f);
++        UGameEngine* GameEngine = (UGameEngine*)Engine;
++        INT HeadlessFrame = 0;
++        for (; HeadlessFrame < HeadlessTicks && !GIsRequestingExit; ++HeadlessFrame)
++            Engine->Tick(1.0f / 60.0f);
++        ULevel* LoadedLevel = GameEngine->GLevel;
++        INT Controllers = 0, BotPawns = 0, ControlledNonVehiclePawns = 0;
++        if (LoadedLevel)
++            for (INT I = 0; I < LoadedLevel->Actors.Num(); ++I)
++            {
++                AActor* Actor = LoadedLevel->Actors(I);
++                if (Actor && Actor->IsA(AController::StaticClass()))
++                {
++                    AController* Controller = (AController*)Actor;
++                    ++Controllers;
++                    if (Controller->Pawn && !Controller->Pawn->IsA(AVehicle::StaticClass()))
++                        ++ControlledNonVehiclePawns;
++                    if (Controller->PlayerReplicationInfo && Controller->PlayerReplicationInfo->bBot && Controller->Pawn)
++                        ++BotPawns;
++                }
++            }
++        AGameInfo* LoadedGame = LoadedLevel ? LoadedLevel->GetLevelInfo()->Game : NULL;
++        debugf(NAME_Log, TEXT("WASM_HEADLESS_PROOF: map=%s game=%s ticks=%i controllers=%i controlledNonVehiclePawns=%i botPawns=%i requestedBots=%d"),
++            LoadedLevel && LoadedLevel->GetOuter() ? LoadedLevel->GetOuter()->GetName() : TEXT("<none>"),
++            LoadedGame ? LoadedGame->GetClass()->GetPathName() : TEXT("<none>"),
++            HeadlessFrame, Controllers, ControlledNonVehiclePawns, BotPawns, Bots);
+ #endif
+ #if defined(UT2004_WEB_CLIENT)
+         if (Interactive)
+-- 
+2.47.3
+

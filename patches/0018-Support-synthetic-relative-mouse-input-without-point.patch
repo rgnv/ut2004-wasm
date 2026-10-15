@@ -1,7 +1,7 @@
 From 4a44551dedd93793af7f69fe5a6aa0def5681356 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 22:48:41 -0700
-Subject: [PATCH 18/21] Support synthetic relative mouse input without pointer
+Subject: [PATCH 18/26] Support synthetic relative mouse input without pointer
  lock
 
 ---
@@ -70,3 +70,6 @@ index 7ebfd24..e4ecad2 100644
                      if (ptrtype == 3) {
                          HEAPF32[idx++] = event.pressure;
                          HEAPF32[idx++] = event.tangentialPressure;
+-- 
+2.47.3
+

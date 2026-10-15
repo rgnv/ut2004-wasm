@@ -1,7 +1,7 @@
 From 96e0e41c61657689efb87f703a0ae9a261618810 Mon Sep 17 00:00:00 2001
 From: hermes <hermes@localhost>
 Date: Wed, 14 Oct 2026 01:00:20 -0700
-Subject: [PATCH 19/21] Link ALAudio through Emscripten WebAudio OpenAL and
+Subject: [PATCH 19/26] Link ALAudio through Emscripten WebAudio OpenAL and
  stream Vorbis music
 
 Compile ALAudio plus the vendored Ogg/Vorbis decoder into the browser target
@@ -527,3 +527,6 @@ index e655a1d..c10c8db 100644
  #else
  
  #  include <ogg/config_types.h>
+-- 
+2.47.3
+

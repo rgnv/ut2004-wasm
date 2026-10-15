@@ -1,7 +1,7 @@
 From a63a4ad0e868dc217e241b932ee26dd7890ca5fd Mon Sep 17 00:00:00 2001
 From: Hermes Agent <hermes@rgnv.dev>
 Date: Wed, 14 Oct 2026 04:49:03 -0700
-Subject: [PATCH 21/21] Fix 3374 native layouts and extended signatures;
+Subject: [PATCH 21/26] Fix 3374 native layouts and extended signatures;
  preserve 3369 boot
 
 ---
@@ -1292,3 +1292,6 @@ index d8ad2e9..b9ec086 100644
  IMPLEMENT_PACKAGE(XInterface);
  
  #define NAMES_ONLY
+-- 
+2.47.3
+

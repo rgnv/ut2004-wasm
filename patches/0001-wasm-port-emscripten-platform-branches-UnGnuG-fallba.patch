@@ -1,7 +1,7 @@
 From ec2638b2189f1025dff86565640a44210269ebdd Mon Sep 17 00:00:00 2001
 From: Hermes Agent <hermes@rgnv.dev>
 Date: Tue, 13 Oct 2026 07:50:01 -0700
-Subject: [PATCH 01/16] wasm port: emscripten platform branches (UnGnuG),
+Subject: [PATCH 01/26] wasm port: emscripten platform branches (UnGnuG),
  fallback rotates/timer, GNUSTATIC fix
 
 ---

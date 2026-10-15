@@ -27,7 +27,7 @@ async function dimensions(expected){const result=await value('({url:location.hre
  await navigate('?interactive=1&res=960x540&fullscreen=1');await dimensions([960,540]);
  await click('#canvas');await until('!!document.fullscreenElement');await dimensions([960,540]);
  await value('document.exitFullscreen().then(()=>true)');await until('!document.fullscreenElement');
- await value('document.getElementById("resolution").value="640x480"');await click('#apply-resolution');
+ await value('document.getElementById("resolution").value="640x480"');await click('#reload-resolution');
  await until('window.shellReady===true && location.search.includes("res=640x480")');await dimensions([640,480]);
  assert.equal(await value('localStorage.getItem("ut2004-resolution")'),'640x480');
  await navigate('?interactive=1');await dimensions([640,480]);

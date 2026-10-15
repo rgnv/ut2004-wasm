@@ -1,7 +1,7 @@
 From eceea6fd8a244c38aeeb2df8ab6d045c35cf74a9 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 08:42:45 -0700
-Subject: [PATCH 05/16] Link static wasm modules and add verified Node
+Subject: [PATCH 05/26] Link static wasm modules and add verified Node
  package-mount boot
 
 ---

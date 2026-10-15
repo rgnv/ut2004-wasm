@@ -1,10 +1,18 @@
 # ut2004-wasm
 
-**Unreal Tournament 2004 in the browser** — a from-scratch [Emscripten](https://emscripten.org/)/WebAssembly port of the UT2004 engine, built from the 2004 source release by way of the community `UT2004_CMAKE` tree. First public release: **v0.1.0**.
+**Unreal Tournament 2004 in the browser** — a from-scratch [Emscripten](https://emscripten.org/)/WebAssembly port of the UT2004 engine, built from the 2004 source release by way of the community `UT2004_CMAKE` tree. Current release: **v0.2.0** (first public release: v0.1.0).
 
 ![UT2004 running in the browser](screenshots/ingame-dm-rankin-1280x720.png)
 
 *DM-Rankin, rendered by the ported engine (SDL3 → OpenGLDrv → GL4ES → WebGL) at a 1280×720 internal canvas in the browser client. Game content © Epic Games — shown running from a privately owned install.*
+
+![The engine's native front-end rendering in the browser](screenshots/entry-direct-menu.png)
+
+*The engine's own front-end, live in the browser (v0.2.0): direct `Entry` startup opens the native main menu, and the intro/splash maps (`MOV-*`, `NoIntro`, `NvidiaLogo`) play through and hand off to it. Game content © Epic Games — screenshots from a privately owned install.*
+
+![Intro hand-off target: the native main menu](screenshots/intro-movie-menu.png)
+
+*After `MOV-UT2004-Intro` plays its authored flow, the hand-off target: the same menu. Full evidence set: `docs/phase13-report.md`.*
 
 ## ⚠️ You bring the game
 
@@ -14,17 +22,17 @@ Built and verified on x86_64 Linux with the two supported data eras: OldUnreal's
 
 ## What works
 
-Status as of the first public release (2026-10-14, all items verified with real runs):
+Status as of **v0.2.0** (2026-10-15, all items verified with real runs):
 
 | Area | State |
 | --- | --- |
-| Headless Node client | ✅ Boots both data eras to a clean `exit 0` — package mount, class binding, map load, bounded ticks. This is the regression baseline. |
-| Browser client | ✅ DM-Rankin boots, loads, and renders with ranged package reads; HUD, weapons, pickups; 0 GL/WebGL/page errors; clean shutdown. |
+| Headless Node client | ✅ Boots both data eras to a clean `exit 0` — package mount, class binding, map load, bounded ticks. Full sweeps: **373/373 map runs across both trees reach play, run 600 ticks, and exit 0 — zero native-bind failures**. This is the regression baseline. |
+| Browser client | ✅ Full map/mode coverage verified in-browser: a 72-case acceptance across every game mode (DM/TDM/CTF/BR/DOM/AS/ONS/Invasion/Mutant/LMS/tutorials) with real spawn/gameplay evidence; the engine's own front-end (splash, intros, main menu) renders; 0 GL/WebGL/page errors; clean shutdowns. |
 | Multiplayer | ✅ Two browser clients joined a native dedicated server through the WebSocket transport, spawned, played, and scored — signon, gameplay, and scoreboard evidence captured from the live deployment. |
 | Audio | ✅ ALAudio → Emscripten WebAudio/OpenAL with streamed Vorbis music. Automated acceptance: music queue consumed at ratio 1.0 over a 60 s soak, SFX firing, first-gesture unlock, non-zero analyser signal. *(What's missing: a human listening check — headless Chrome has no audio device, so acceptance proves the signal chain, not the sound.)* |
 | Display | ✅ Resolution selector (640×480 / 960×540 / 1280×720, plus `?res=WxH` and persistence), responsive canvas, fullscreen button / `?fullscreen=1`. |
 | Input | ✅ Keyboard + mouse with 1:1 relative input (including a no-pointer-lock fallback), bundled touch/controller kit for mobile. |
-| Map coverage | ✅ 27 maps boot/spawn-verified (DM/CTF/BR/ONS mix); the shell ships a 242-map picker. Some maps remain untested — an unlinked native class fails with `Can't bind to native class <Pkg>.<Class>`. |
+| Map coverage | ✅ Every map in both data trees boots, loads and plays (headless and browser; see `docs/phase13-report.md`). A handful of community add-on maps carry authored-data errors — documented, not hidden. The shell ships a 242-map picker. |
 | Server features | ✅ The reference deployment runs with map travel (no crash), xVoting enabled, and auto-admin for every joining player. |
 | Gamma/brightness | ⚠️ No software gamma; maps render at their native lighting in the browser. |
 
@@ -34,7 +42,7 @@ Observed on the live deployment (headless Chrome): DM-Rankin first frame **118.7
 
 ### The fast path (prebuilt)
 
-1. Grab `ut2004-web-v0.1.0.tar.gz` from the releases page and extract it.
+1. Grab `ut2004-web-v0.2.0.tar.gz` from the releases page and extract it.
 2. Provision game data into a directory of your own:
 
    ```bash
@@ -60,7 +68,7 @@ Observed on the live deployment (headless Chrome): DM-Rankin first frame **118.7
 Prerequisites: x86_64 Linux, Docker, Node.js ≥ 22, `brotli`, Python 3, ~10 GB free disk.
 
 ```bash
-# 1. Fetch the pinned community engine tree + GL4ES and apply the 21-patch port series.
+# 1. Fetch the pinned community engine tree + GL4ES and apply the 26-patch port series.
 scripts/setup-sources.sh
 
 # 2. Provision game data (approved ISO + pinned 3374 patch). No sudo.
@@ -142,12 +150,12 @@ Click the viewport to focus, then: **WASD** move · **mouse** look · **left/rig
 - **One wasm image, nothing embedded.** The engine compiles to a single ~22 MB wasm (≈4.8 MB brotli). Game packages are fetched from *your* HTTP server at runtime — config files up front, packages lazily via byte ranges (`wasi_snapshot_preview1.fd_read` under Asyncify).
 - **Renderer**: the engine's own OpenGLDrv, with SDL3 (built from the tree) and GL4ES translating GL to WebGL2/ES2.
 - **The GC fix that mattered most**: the engine's recursive `FArchiveTagUsed` mark walk overflows the JS/wasm stack at ~2,629 depth on valid graphs. Under Emscripten it is replaced with an iterative worklist that produces identical marks (50,971 entries compared byte-identical). Native recursion is untouched.
-- **3374 support**: 49 runtime native entries implemented plus 4 existing-native signature extensions and cross-era layout handling, so the same client runs both the 3374-preview-23 and final 3369 package sets. The 21-patch series applied to the pinned tree reconstructs the verified engine tree byte-identically.
+- **3374 support**: 49 runtime native entries implemented plus 4 existing-native signature extensions and cross-era layout handling, so the same client runs both the 3374-preview-23 and final 3369 package sets. The 26-patch series applied to the pinned tree reconstructs the verified engine tree byte-identically.
 
 ```text
 build-em.sh   per-module emcc harness        link-em.sh  → headless Node client
 link-web.sh   → browser client (build/web/)  web/        shell, mobile kit, pre.js, HTTP library
-patches/      the 21-patch source series     components/relay/  ws ⇄ UDP relay
+patches/      the 26-patch source series     components/relay/  ws ⇄ UDP relay
 scripts/      CDP + HTTP harnesses, data/install/serve scripts    docs/  port reports & RE notes
 ```
 
@@ -157,7 +165,7 @@ Heavy directories (`src/`, `data3369/`, `build/`, `node_modules/`) are git-ignor
 
 - **Data eras**: verified against final official **3369** and OldUnreal **3374-preview-23** only. Arbitrary later community package sets are not claimed; use the supported versions (`install-game-data.sh` provisions 3374-preview-23).
 - **Audio**: signal-verified by automated acceptance; a physical listening check is still outstanding.
-- **Coverage**: some maps/modules are not linked; a map referencing an unlinked native fails at bind time. 27 maps are play-verified so far.
+- **Coverage**: all maps in both supported data trees now boot, load and play; the remaining known issues are authored-data errors in a few community add-on maps plus documented quirks (`docs/phase13-report.md`). Nothing is hidden behind no-op stubs.
 - **Startup time**: cold first frame is tens of seconds. Full-file prefetch was tried and *regressed* startup — the ranged read path is intentional. A real progress bar needs a relink with `INCOMING_MODULE_JS_API` extended for `wasmBinary` (documented in `docs/phase7-report.md`).
 - **Browser support**: desktop Chromium tested (including iGPU); WebGL1/ES2-class hardware required.
 
@@ -175,4 +183,4 @@ Heavy directories (`src/`, `data3369/`, `build/`, `node_modules/`) are git-ignor
 
 ## Documentation
 
-The `docs/` directory carries the engineering trail: phase reports (`phase2c` → `phase8`), `CHANGES-wasm-port.md` (every source change), and the reverse-engineering groundwork (`toolchain-and-method.md`, `re-modules.md`, `swap-points.md`, `linkage-notes.txt`). The 21-patch series is described in `patches/README.md`.
+The `docs/` directory carries the engineering trail: phase reports (`phase2c` → `phase13`), `CHANGES-wasm-port.md` (every source change), and the reverse-engineering groundwork (`toolchain-and-method.md`, `re-modules.md`, `swap-points.md`, `linkage-notes.txt`). The 26-patch series is described in `patches/README.md`.

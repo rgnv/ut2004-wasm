@@ -1,0 +1,121 @@
+From afd9d95182ddf5dd9c69d775e316575299bb3eb5 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Wed, 14 Oct 2026 11:22:17 -0700
+Subject: [PATCH 23/26] Drain fullscreen callbacks and preserve tutorial
+ cinematic startup
+
+---
+ CHANGES-wasm-port.md            | 14 +++++++++++
+ Launch/Src/LaunchEmscripten.cpp | 44 +++++++++++++++++++++++++++++----
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index 8714332..dddb0ec 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -595,3 +595,17 @@ launcher under Emscripten instead of a pre-runtime global constructor.
+   the engine's default map-to-game selection.
+ - Raw census and teardown evidence: wrapper `build/phase13/`; coverage and
+   remaining acceptance results are documented in wrapper `docs/phase13-report.md`.
++- Final headless sweep: 373/373 maps reach play, finish 600 ticks, and exit zero;
++  zero native-bind failures. Authored add-on class/data errors remain visible.
++- Browser shutdown awaits fullscreen restoration and its next animation frame
++  before appPreExit destroys SDL viewport callback userdata. This fixes the
++  observed `dynCall_iiii` after-runtime-exit abort without keeping a dead runtime
++  alive or suppressing assertions.
++- Local tutorial launches use the shipped menu protocol: NumBots=0,
++  QuickStart=true, TeamScreen=false. Player evidence distinguishes a possessed
++  pawn from a real SceneManager OldPawn temporarily unpossessed by Matinee.
++  The actor scan occurs only on cinematic entry, not every frame.
++- Pve Chrome focused verification: DM-Rankin and TUT-DM both render with zero
++  GL/page errors, observe real pawn possession/handoff, and exit zero including
++  a one-second asynchronous teardown observation window.
++  Evidence: wrapper `build/phase13/browser-fix-smoke/`.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 2e5d22c..387d390 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -24,6 +24,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE int ut2004_request_resolution(int w, int h)
+ EM_ASYNC_JS(void, WaitForBrowserFrame, (), {
+     await new Promise(requestAnimationFrame);
+ });
++// Fullscreen restoration invokes SDL's native resize callback asynchronously.
++// Drain it before destroying the viewport or exiting the WASM runtime.
++EM_ASYNC_JS(void, ExitBrowserFullscreen, (), {
++    if (document.fullscreenElement) {
++        await document.exitFullscreen();
++        await new Promise(requestAnimationFrame);
++    }
++});
+ #endif
+ 
+ INT GFilesOpen, GFilesOpened;
+@@ -79,9 +87,12 @@ int main(int argc, char** argv)
+     char Map[256];
+     EM_ASM({ stringToUTF8((Module.map || 'DM-Rankin') + (Module.gameClass ? '?game=' + Module.gameClass : ''), $0, $1); }, Map, sizeof(Map));
+     const UBOOL LocalMap = EM_ASM_INT({ return Module.localMap ? 1 : 0; });
+-    char BrowserCommandLine[320];
+-    snprintf(BrowserCommandLine, sizeof(BrowserCommandLine), "%s?NumBots=%i -nohomedir%s",
+-        Map, LocalMap ? 2 : 0, NoSound ? " -nosound" : "");
++    const UBOOL Tutorial = LocalMap && !strncmp(Map, "TUT-", 4);
++    char BrowserCommandLine[384];
++    // Match the shipped tutorial menu's launch protocol.
++    snprintf(BrowserCommandLine, sizeof(BrowserCommandLine), "%s?NumBots=%i%s -nohomedir%s",
++        Map, Tutorial ? 0 : LocalMap ? 2 : 0,
++        Tutorial ? "?QuickStart=true?TeamScreen=false" : "", NoSound ? " -nosound" : "");
+     const TCHAR* CommandLine = Interactive && !Splash ? BrowserCommandLine
+         : (Interactive && !NoSound ? TEXT("-nohomedir") : TEXT("-nohomedir -nosound"));
+ #else
+@@ -178,6 +189,8 @@ int main(int argc, char** argv)
+         // Only the dedicated 3369 relay opts into the shared admin login.
+         const UBOOL AutoAdmin = EM_ASM_INT({ return Module.connect && Module.relayURL === 'wss://games.rgnv.dev/ut2004b/connect2' ? 1 : 0; });
+         APlayerController* AdminPlayer = NULL;
++        APlayerController* CinematicPlayer = NULL;
++        UBOOL CinematicPawnSpawned = 0;
+         DOUBLE AdminSent = 0;
+         UBOOL AdminReported = 0;
+         INT Frame = 0;
+@@ -235,10 +248,28 @@ int main(int argc, char** argv)
+                     }
+                 }
+                 AActor* Target = Player->Pawn ? (AActor*)Player->Pawn : (AActor*)Player;
+-                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7, netMode: $8, admin: !!$9}); },
++                if (!Player->bViewingMatineeCinematic) {
++                    CinematicPlayer = NULL;
++                    CinematicPawnSpawned = 0;
++                } else if (CinematicPlayer != Player) {
++                    CinematicPlayer = Player;
++                    CinematicPawnSpawned = 0;
++                    // Once per cinematic entry, observe the pawn Matinee unpossessed.
++                    ULevel* Level = Player->GetLevel();
++                    for (INT I = 0; I < Level->Actors.Num(); ++I) {
++                        AActor* Actor = Level->Actors(I);
++                        if (Actor && Actor->IsA(ASceneManager::StaticClass())) {
++                            ASceneManager* Scene = (ASceneManager*)Actor;
++                            if (Scene->Viewer == Player && Scene->OldPawn)
++                                CinematicPawnSpawned = 1;
++                        }
++                    }
++                }
++                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7, netMode: $8, admin: !!$9, cinematic: !!$10, cinematicPawnSpawned: !!$11}); },
+                     Frame, Target->Location.X, Target->Location.Y, Target->Location.Z,
+                     Player->Rotation.Pitch, Player->Rotation.Yaw, Player->Rotation.Roll, Player->Pawn != NULL, Player->Level->NetMode,
+-                    Player->PlayerReplicationInfo && Player->PlayerReplicationInfo->bAdmin);
++                    Player->PlayerReplicationInfo && Player->PlayerReplicationInfo->bAdmin,
++                    Player->bViewingMatineeCinematic, CinematicPawnSpawned);
+             }
+         }
+         GIsRunning = 0;
+@@ -280,6 +311,9 @@ int main(int argc, char** argv)
+         else
+             debugf(NAME_Init, TEXT("WASM: bounded loop complete"));
+     }
++#if defined(UT2004_WEB_CLIENT)
++    ExitBrowserFullscreen();
++#endif
+     // This probe must not rewrite the installed game's configuration on exit.
+     for (FConfigCacheIni::TIterator It(*(FConfigCacheIni*)GConfig); It; ++It) It.Value().NoSave = 1;
+     appPreExit();
+-- 
+2.47.3
+

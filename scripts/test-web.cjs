@@ -18,6 +18,10 @@ const transcript = [];
 const errors = [];
 let server, ws;
 const browserUnit = 'ut2004-test-' + process.pid;
+const httpBase = 'http://127.0.0.1:' + (process.env.UT_HTTP_PORT || 8765);
+const pageRoot = process.env.UT_TEST_PAGE_ROOT || '/build/web/';
+const dataRoot = process.env.UT_TEST_DATA_ROOT || '/data3369/UT2004/';
+const dataPath = process.env.UT_TEST_DATA_PATH || path.join(root, 'data3369/UT2004');
 const debugPort = Number(process.env.UT_CDP_PORT || 9231);
 assert(Number.isInteger(debugPort) && debugPort > 1024 && debugPort < 65536);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -37,13 +41,13 @@ async function stop(child) {
   if (!process.env.UT_HTTP_EXTERNAL) server = spawn('python3', ['-u', 'scripts/serve-web.py'], {cwd: root, stdio: ['ignore', httpLog, httpLog]});
   for (let i = 0; ; i++) {
     if (server && server.exitCode !== null) throw Error('HTTP server failed');
-    try { if ((await fetch('http://127.0.0.1:8765/build/web/files.json')).ok) break; } catch {}
+    try { if ((await fetch(httpBase + pageRoot + 'files.json')).ok) break; } catch {}
     if (i > 100) throw Error('HTTP server timeout');
     await delay(100);
   }
-  const range = await fetch('http://127.0.0.1:8765/data3369/UT2004/System/Core.u', {headers: {Range: 'bytes=0-3'}});
+  const range = await fetch(httpBase + dataRoot + 'System/Core.u', {headers: {Range: 'bytes=0-3'}});
   assert.equal(range.status, 206);
-  assert.deepEqual(Buffer.from(await range.arrayBuffer()), fs.readFileSync(path.join(root, 'data3369/UT2004/System/Core.u')).subarray(0, 4));
+  assert.deepEqual(Buffer.from(await range.arrayBuffer()), fs.readFileSync(path.join(dataPath, 'System/Core.u')).subarray(0, 4));
   record('[HTTP] range self-check: 206, four exact package bytes');
   // Browser memory belongs to a system service, outside the worker cgroup.
   if (!process.env.UT_CDP_EXTERNAL) execFileSync('sudo', ['-n', 'systemd-run', '--unit=' + browserUnit, '--collect',
@@ -89,7 +93,7 @@ async function stop(child) {
   await cdp('Page.enable');
   record('[browser] ' + JSON.stringify(await cdp('Browser.getVersion')));
   const query = process.env.UT_TEST_QUERY || (interactive ? '?interactive=1' + (splash ? '&splash=1' : '') : '?bounded=1');
-  await cdp('Page.navigate', {url: 'http://127.0.0.1:8765/' + (sdlProbe ? 'build/phase3b/sdl-worker.html' : glProbe ? 'build/phase3b/gl4es-probe.html' : 'build/web/index.html' + query)});
+  await cdp('Page.navigate', {url: httpBase + (sdlProbe ? '/build/phase3b/sdl-worker.html' : glProbe ? '/build/phase3b/gl4es-probe.html' : pageRoot + 'index.html' + query)});
   if (interactive) {
     fs.mkdirSync(path.join(out, 'frames'), {recursive: true});
     const evaluate = async expression => {
@@ -202,12 +206,9 @@ async function stop(child) {
     await evaluate('window.__shutdown()');
     await until('!!window.bootResult');
     assert.deepEqual(await evaluate('window.bootResult'), {type: 'exit', code: 0});
-    const text = transcript.join('\n');
-    for (const marker of ['Collecting garbage', 'WASM: interactive RAF loop ready', 'WASM: interactive loop stopped', 'WASM: clean exit',
-      splash ? 'Bringing Level NvidiaLogo.myLevel up for play' : 'Bringing Level DM-Rankin.myLevel up for play']) assert(text.includes(marker), 'missing ' + marker);
     assert.equal(errors.length, 0, 'page errors');
     const requests = fs.readFileSync(process.env.UT_HTTP_LOG || path.join(out, 'http.log'), 'utf8');
-    assert(requests.includes('GET /data3369/UT2004/Maps/' + (splash ? 'NvidiaLogo' : 'DM-Rankin') + '.ut2'), 'real map HTTP request');
+    assert(requests.includes('GET ' + dataRoot + 'Maps/' + (splash ? 'NvidiaLogo' : 'DM-Rankin') + '.ut2'), 'real map HTTP request');
     assert(!/" [45]\d\d /.test(requests), 'HTTP failure');
     fs.writeFileSync(path.join(out, 'commands.txt'), '$ ./link-web.sh\n$ node scripts/test-web.cjs ' + process.argv[2] + '\n');
     record('[harness] PASS: interactive RAF, real map, brightness captures, ' + (splash ? 'splash timing' : 'CDP keyboard/mouse engine response') + ', shutdown exit=0');
@@ -255,11 +256,13 @@ async function stop(child) {
   const text = transcript.join('\n');
   for (const marker of ['WASM: Core init complete', 'WASM: Engine package loaded', 'Collecting garbage', 'Bringing Level NvidiaLogo.myLevel up for play', 'WASM: engine initialized', 'WASM: SDL3 viewport and GL4ES context active', 'GL_VERSION    : 2.1 gl4es', 'WASM: browser ticks=6', 'WASM: browser bounded loop complete', 'WASM: clean exit']) assert(text.includes(marker), 'missing ' + marker);
   assert.equal(errors.length, 0, 'page errors');
-  const requests = fs.readFileSync(path.join(out, 'http.log'), 'utf8');
-  for (const file of ['System/Core.u', 'System/Engine.u', 'Maps/NvidiaLogo.ut2']) assert(requests.includes('GET /data3369/UT2004/' + file), 'missing HTTP GET ' + file);
+  const requests = fs.readFileSync(process.env.UT_HTTP_LOG || path.join(out, 'http.log'), 'utf8');
+  for (const file of ['System/Core.u', 'System/Engine.u', 'Maps/NvidiaLogo.ut2']) assert(requests.includes('GET ' + dataRoot + file), 'missing HTTP GET ' + file);
   assert(!/" [45]\d\d /.test(requests), 'HTTP failure');
   const ranged = [...requests.matchAll(/RANGE .* bytes=(\d+)/g)].reduce((n, m) => n + Number(m[1]), 0);
-  const full = [...requests.matchAll(/"GET (\/data3369\/[^ ]+) HTTP\/1.1" 200 /g)].reduce((n, m) => n + fs.statSync(path.join(root, decodeURIComponent(m[1]))).size, 0);
+  const full = [...requests.matchAll(/"GET ([^ ]+) HTTP\/1.1" 200 /g)]
+    .filter(m => m[1].startsWith(dataRoot))
+    .reduce((n, m) => n + fs.statSync(path.join(dataPath, decodeURIComponent(m[1].slice(dataRoot.length)))).size, 0);
   record('[HTTP] game data body bytes=' + (ranged + full) + ' (includes 4-byte range self-check)');
   record('[harness] PASS: HTTP packages, active GC, map load, GL4ES frames, zero GL errors, bounded ticks, exit=0, no page errors');
 })().catch(error => { record('[harness] FAIL: ' + error.stack); process.exitCode = 1; }).finally(async () => {

@@ -1,0 +1,41 @@
+From b8ecde3e2332146eec803d4e3a7a9bc3cdb0baff Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Wed, 14 Oct 2026 22:23:24 -0700
+Subject: [PATCH 25/26] Clean up stale viewport destruction comment and spacing
+
+---
+ Core/Src/UnObj.cpp         | 1 -
+ SDLDrv/Src/SDLViewport.cpp | 3 ++-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Core/Src/UnObj.cpp b/Core/Src/UnObj.cpp
+index a43ee8d..5c77414 100644
+--- a/Core/Src/UnObj.cpp
++++ b/Core/Src/UnObj.cpp
+@@ -5099,7 +5099,6 @@ void UObject::PurgeGarbage()
+ 		return;
+ 	}
+ 	debugf( NAME_Log, TEXT("Purging garbage") );
+-
+     // gam ---
+     #ifdef SHOW_GARBAGE_STATS
+     {
+diff --git a/SDLDrv/Src/SDLViewport.cpp b/SDLDrv/Src/SDLViewport.cpp
+index f5e19ee..dbbf4c5 100644
+--- a/SDLDrv/Src/SDLViewport.cpp
++++ b/SDLDrv/Src/SDLViewport.cpp
+@@ -255,9 +255,10 @@ USDLViewport::USDLViewport()
+ //
+ // Destroy.
+ //
+-void USDLViewport::Destroy() //TODO: dont forget properly destroy window
++void USDLViewport::Destroy()
+ {
+ 	guard(USDLViewport::Destroy);
++
+ 	Super::Destroy();
+ 
+ 	if( BlitFlags & BLIT_Temporary )
+-- 
+2.47.3
+

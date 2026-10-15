@@ -1,7 +1,7 @@
 From 491b6c65e57a4e4e6da797719210fb8b9a3bc3f0 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 09:14:02 -0700
-Subject: [PATCH 06/16] Refine wasm GC depth probes and preserve selectable
+Subject: [PATCH 06/26] Refine wasm GC depth probes and preserve selectable
  boot data
 
 ---

@@ -2,14 +2,14 @@
  * 1. Touch move: independently owned pointer IDs, eight-way keys, radial deadzone.
  * 2. Look: relative mousemove deltas; sensitivity, acceleration off by default.
  * 3. Buttons: configured keyboard/mouse/wheel bindings, reference-counted across sources.
- * 4. Menu: absolute cursor and tap-click; explicit MENU/POINTER toggle, Esc remains available.
+ * 4. Menu: absolute cursor and tap-click; MENU/POINTER toggle; touch.menuNavigation adds arrows/Enter.
  * 5. OS-paired Bluetooth/USB Gamepad API: rAF, radial deadzone/normalization, analog triggers,
  *    dpad arrows, hotplug toasts. Runs independently of touch detection.
  * 6. QoL: scoped touch suppression, safe-area CSS, optional fullscreen/orientation,
  *    wake lock and audio resume + canvas click on first gesture (best effort).
  * 7. Desktop: auto coarse/touch detection; force on/off overrides ?touch=1/0; no global capture.
  * pointerEvents enables SDL3's PointerEvent adapter; mobileInputRelative requires the small
- * SDL bridge shipped with UT2004. Other ports consume the standard MouseEvents alone.
+ * SDL bridge shipped with UT2004. MouseEvents carry the same marker for SDL2 shell bridges.
  * destroy() releases held input, listeners, rAF and wake lock. setMenuMode(bool) is optional.
  */
 (() => {
@@ -23,7 +23,7 @@
     const abort = new AbortController();
     const listen = (node, type, fn, options = {}) => node.addEventListener(type, fn, {...options, signal: abort.signal});
     const sources = new Map(), held = new Map(), touches = new Map();
-    let menu = false, destroyed = false, frame, previous = 0, wake, waking = false, unlocked = false, toastTimer;
+    let menu = false, destroyed = false, frame, previous = 0, wake, waking = false, unlocked = false, fullscreenAttempted = false, toastTimer;
     let mouseButtons = 0, cursor = {x: .5, y: .5};
     const root = document.createElement('div');
     root.className = 'mobile-input';
@@ -41,7 +41,9 @@
         Object.defineProperty(event, 'mobileInputRelative', {value: relative || type !== 'mousemove'});
         canvas.dispatchEvent(event);
       }
-      canvas.dispatchEvent(new MouseEvent(type, init));
+      const event = new MouseEvent(type, init);
+      Object.defineProperty(event, 'mobileInputRelative', {value: relative});
+      canvas.dispatchEvent(event);
     }
     const resolve = action => binds[action] || action;
     function emit(binding, down) {
@@ -55,7 +57,7 @@
       } else {
         const code = binding.code;
         const key = binding.key || (/^Key/.test(code) ? code.slice(3).toLowerCase() : /^Digit/.test(code) ? code.slice(5) : {Space:' ',Escape:'Escape',Enter:'Enter',Tab:'Tab'}[code] || code);
-        const keyCode = binding.keyCode || (/^Key/.test(code) ? code.charCodeAt(3) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : {Space:32,Escape:27,Enter:13,Tab:9,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40}[code] || 0);
+        const keyCode = binding.keyCode || (/^Key/.test(code) ? code.charCodeAt(3) : /^Digit/.test(code) ? code.charCodeAt(5) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : {Space:32,Escape:27,Enter:13,Tab:9,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40}[code] || 0);
         canvas.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup', {bubbles:true, cancelable:true, code, key, keyCode, which:keyCode}));
       }
     }
@@ -111,6 +113,18 @@
       pointer.hidden = !menu;
       if (menu) { document.exitPointerLock?.(); drawCursor(); }
     }
+    function fullscreen() {
+      try { Promise.resolve(host.requestFullscreen?.()).then(() => {
+        if (qos.orientation) return screen.orientation?.lock(qos.orientation);
+      }).catch(() => {}); } catch (_) {}
+    }
+    function fullscreenOnTap(control) {
+      // Touch grants transient activation on pointerup, not pointerdown.
+      if (control.dataset.control === 'fullscreen' || (qos.fullscreen && enabled && !fullscreenAttempted)) {
+        fullscreenAttempted = true;
+        fullscreen();
+      }
+    }
     async function keepAwake() {
       if (qos.keepAwake === false || wake || waking || document.hidden || destroyed) return;
       waking = true;
@@ -128,11 +142,6 @@
       if (unlocked) return;
       unlocked = true;
       keepAwake();
-      if (qos.fullscreen && enabled) {
-        try { Promise.resolve(host.requestFullscreen?.()).then(() => {
-          if (qos.orientation) return screen.orientation?.lock(qos.orientation);
-        }).catch(() => {}); } catch (_) {}
-      }
     }
     function element(tag, className, label) {
       const e = document.createElement(tag); e.className = className;
@@ -150,7 +159,16 @@
     const toggle = element('button', 'mobile-input-toggle', 'MENU / POINTER');
     toggle.dataset.control = 'toggle'; toggle.hidden = touch.menuMode === false;
     toggle.setAttribute('aria-pressed', 'false');
-    for (const button of touch.buttons || []) {
+    if (qos.fullscreen) {
+      const full = element('button', 'mobile-input-fullscreen', 'FULLSCREEN');
+      full.dataset.control = 'fullscreen';
+    }
+    const navigation = touch.menuNavigation ? [
+      {id:'navup',key:'ArrowUp',label:'↑'}, {id:'navdown',key:'ArrowDown',label:'↓'},
+      {id:'navleft',key:'ArrowLeft',label:'←'}, {id:'navright',key:'ArrowRight',label:'→'},
+      {id:'enter',key:'Enter',label:'ENTER'}
+    ] : [];
+    for (const button of [...(touch.buttons || []), ...navigation]) {
       const e = element('button', 'mobile-input-button', button.label);
       e.dataset.control = 'button'; e.dataset.action = button.key || button.id;
       e.dataset.id = button.id;
@@ -161,6 +179,7 @@
       if (!control || (e.pointerType === 'mouse' && e.button !== 0)) return;
       e.preventDefault(); e.stopPropagation(); gesture();
       const kind = control.dataset.control;
+      if (kind === 'fullscreen') return;
       if (kind === 'toggle') { setMenuMode(!menu); return; }
       if ([...touches.values()].some(t => t.kind === kind && kind !== 'button')) return;
       control.setPointerCapture(e.pointerId);
@@ -189,6 +208,8 @@
       }
     });
     function end(e) {
+      const control = e.target.closest('[data-control]');
+      if (e.type === 'pointerup' && control) fullscreenOnTap(control);
       const t = touches.get(e.pointerId); if (!t) return;
       e.preventDefault(); e.stopPropagation();
       set(`touch:${e.pointerId}`, []); touches.delete(e.pointerId);
@@ -203,11 +224,14 @@
       const control = e.target.closest('button');
       if (!control || e.detail !== 0 || !e.isTrusted) return;
       gesture();
-      if (control.dataset.control === 'toggle') setMenuMode(!menu);
+      fullscreenOnTap(control);
+      if (control.dataset.control === 'fullscreen') return;
+      else if (control.dataset.control === 'toggle') setMenuMode(!menu);
       else { set('keyboard-button', [control.dataset.action]); setTimeout(() => { if (!destroyed) set('keyboard-button', []); }, 100); }
     });
     for (const name of ['click','dblclick','contextmenu','touchstart','touchmove']) listen(root, name, e => { e.preventDefault(); e.stopPropagation(); }, {passive:false});
     listen(canvas, 'pointerdown', e => { if (e.isTrusted) gesture(); });
+    listen(canvas, 'pointerup', e => { if (e.isTrusted) fullscreenOnTap(canvas); });
     listen(window, 'blur', release);
     listen(document, 'visibilitychange', () => { if (document.hidden) { release(); wake?.release().catch(() => {}); } else if (unlocked) keepAwake(); });
     function notify(message) {

@@ -1,7 +1,7 @@
 From 32a62ef167f2d66bd4c5301630799b456b3cf98e Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 09:18:20 -0700
-Subject: [PATCH 08/16] Allow wasm socket startup when broadcast option is
+Subject: [PATCH 08/26] Allow wasm socket startup when broadcast option is
  unsupported
 
 ---

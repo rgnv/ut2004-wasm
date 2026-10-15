@@ -1,18 +1,31 @@
-// Live-site QA: pve Chrome over SSH tunnel plus a separate mesa browser.
+// Two live clients in separate windows of one externally managed pve Chrome.
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const WebSocket = require('ws');
-const out = 'build/phase6';
+const out = process.env.UT_TEST_OUT || 'build/phase12/live';
+fs.mkdirSync(out, {recursive: true});
+const port = Number(process.env.UT_CDP_PORT || 19222);
+const base = process.env.UT_LIVE_URL || 'https://games.rgnv.dev/ut2004/';
 const delay = ms => new Promise(r => setTimeout(r, ms));
 const clients = [];
-async function attach(port, name) {
-  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-  const target = targets.find(t => t.type === 'page');
+async function attach(name) {
+  const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+  const control = new WebSocket(version.webSocketDebuggerUrl.replace(/localhost:\d+|127\.0\.0\.1:\d+/, `127.0.0.1:${port}`));
+  await new Promise((resolve, reject) => { control.once('open', resolve); control.once('error', reject); });
+  const targetId = await new Promise((resolve, reject) => {
+    control.on('message', raw => {
+      const message = JSON.parse(raw);
+      if (message.id === 1) message.error ? reject(Error(JSON.stringify(message.error))) : resolve(message.result.targetId);
+    });
+    control.send(JSON.stringify({id:1, method:'Target.createTarget', params:{url:'about:blank',newWindow:true}}));
+  }).finally(() => control.close());
+  const target = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t => t.id === targetId);
+  assert(target, 'new client window not present in CDP target inventory');
   const ws = new WebSocket(target.webSocketDebuggerUrl.replace(/localhost:\d+|127\.0\.0\.1:\d+/, `127.0.0.1:${port}`));
   await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   let id = 0;
   const pending = new Map(), log = [], failures = [];
-  const c = {ws, name, log, failures}; clients.push(c);
+  const c = {ws, name, log, failures, targetId: target.id}; clients.push(c);
   ws.on('message', raw => {
     const m = JSON.parse(raw);
     if (m.id) { const p = pending.get(m.id); if (p) { pending.delete(m.id); m.error ? p.reject(Error(JSON.stringify(m.error))) : p.resolve(m.result); } }
@@ -22,6 +35,7 @@ async function attach(port, name) {
       if (/WASM signon|WebSocket|interactive RAF|engine frame/.test(line)) console.log(name, line);
     } else if (m.method === 'Runtime.exceptionThrown') { failures.push(m.params); log.push(JSON.stringify(m)); }
     else if (m.method === 'Network.responseReceived' && m.params.response.status >= 400) failures.push(m.params.response);
+    else if (m.method === 'Page.frameNavigated' && !m.params.frame.parentId) log.push('NAVIGATED '+m.params.frame.url);
   });
   c.cdp = (method, params = {}) => new Promise((resolve, reject) => {
     const key = ++id; pending.set(key, {resolve, reject}); ws.send(JSON.stringify({id:key, method, params}));
@@ -44,7 +58,7 @@ async function attach(port, name) {
   };
   await c.cdp('Runtime.enable'); await c.cdp('Network.enable'); await c.cdp('Page.enable');
   await c.cdp('Network.setCacheDisabled',{cacheDisabled:true});
-  c.started=Date.now(); c.url=`https://games.rgnv.dev/ut2004/?interactive=1&connect=1&name=${name}`;
+  c.started=Date.now(); c.url=`${base}?interactive=1&connect=1&name=${name}`;
   log.push('LIVE URL '+c.url);
   await c.cdp('Page.navigate',{url:c.url});
   return c;
@@ -65,8 +79,8 @@ async function spawn(c) {
   await c.capture('ingame'); console.log(c.name,'SPAWNED',c.spawnMs,'ms; first frame',c.firstFrame);
 }
 (async()=>{
-  const a=await attach(19222,'PveQA');
-  const b=await attach(19223,'PvpQA');
+  const a=await attach('PveQA');
+  const b=await attach('PvpQA');
   await Promise.all([spawn(a),spawn(b)]);
   await delay(2000);
   for(const c of clients) {
@@ -81,6 +95,6 @@ async function spawn(c) {
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(async()=>{
   for(const c of clients) {
     fs.writeFileSync(`${out}/${c.name}-console.log`,c.log.join('\n')+'\n');
-    try {await c.cdp('Browser.close');} catch {} c.ws.close();
+    try {await c.cdp('Page.close');} catch {} c.ws.close();
   }
 });

@@ -1,7 +1,7 @@
 From b1c50b98e53cba3f1ec30b47df873f2cc3dad415 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 09:16:57 -0700
-Subject: [PATCH 07/16] Trace wasm GC with a worklist to avoid host stack
+Subject: [PATCH 07/26] Trace wasm GC with a worklist to avoid host stack
  exhaustion
 
 ---

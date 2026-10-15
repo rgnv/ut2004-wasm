@@ -1,7 +1,7 @@
 From 3c00eecee156a80433404fcc0ed75c0d49d754b6 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 22:30:39 -0700
-Subject: [PATCH 17/21] Fix web relative mouse precision and apply live
+Subject: [PATCH 17/26] Fix web relative mouse precision and apply live
  resolution between ticks
 
 ---
@@ -245,3 +245,6 @@ index c270fda..f5e19ee 100644
  			break;
  
  		default:
+-- 
+2.47.3
+

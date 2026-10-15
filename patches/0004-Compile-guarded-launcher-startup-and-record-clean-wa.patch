@@ -1,7 +1,7 @@
 From 3347fabba442d120af130e9815da05fa8c36f210 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 08:12:09 -0700
-Subject: [PATCH 04/16] Compile guarded launcher startup and record clean wasm
+Subject: [PATCH 04/26] Compile guarded launcher startup and record clean wasm
  acceptance
 
 ---

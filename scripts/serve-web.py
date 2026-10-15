@@ -49,5 +49,5 @@ class Handler(SimpleHTTPRequestHandler):
             self.remaining -= len(chunk)
 
 if __name__ == '__main__':
-    os.chdir(Path(__file__).resolve().parents[1])
-    ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
+    os.chdir(os.environ.get('UT_HTTP_ROOT', Path(__file__).resolve().parents[1]))
+    ThreadingHTTPServer(('127.0.0.1', int(os.environ.get('UT_HTTP_PORT', '8765'))), Handler).serve_forever()

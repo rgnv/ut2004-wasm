@@ -2,13 +2,13 @@ const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
 const source=fs.readFileSync('web/index.html','utf8').split('<script>')[1].split("const defaultJoin =")[0];
 function shell(query,saved,blocked=false){
   const elements={};let assigned,listener;
-  for(const id of ['canvas','viewport','resolution','fullscreen','display-status','apply-resolution'])elements[id]={style:{setProperty(){}},addEventListener(){},focus(){}};
-  const selector=elements.resolution;selector.options=['640x480','960x540','1280x720'].map(value=>({value}));selector.add=o=>selector.options.push(o);
+  for(const id of ['canvas','viewport','resolution','fullscreen','display-status','apply-resolution','reload-resolution','custom-resolution','resolution-width','resolution-height'])elements[id]={style:{setProperty(){}},addEventListener(){},focus(){}};
+  const selector=elements.resolution;selector.options=['640x480','960x540','1280x720','dynamic','custom'].map(value=>({value}));selector.add=o=>selector.options.push(o);selector.querySelector=()=>selector.options[3];
   const storage={getItem(){if(blocked)throw Error('blocked');return saved;},setItem(k,v){if(blocked)throw Error('blocked');saved=v;}};
   const document={getElementById:id=>elements[id],addEventListener:(type,fn)=>{listener=fn;},fullscreenElement:null};
-  const context={window:{},URLSearchParams,URL,Option:function(text,value){this.value=value;},localStorage:storage,document,location:{search:query,href:'https://games.rgnv.dev/ut2004/'+query,assign:url=>{assigned=String(url);}}};
+  const context={window:{addEventListener(){}},innerWidth:1600,innerHeight:900,devicePixelRatio:1,URLSearchParams,URL,Option:function(text,value){this.value=value;},localStorage:storage,document,location:{search:query,href:'https://games.rgnv.dev/ut2004/'+query,assign:url=>{assigned=String(url);}}};
   vm.runInNewContext(source,context);
-  return {elements,dimensions:[elements.canvas.width,elements.canvas.height],apply(value){selector.value=value;elements['apply-resolution'].onclick();return {saved,assigned};},document,listener};
+  return {elements,dimensions:[elements.canvas.width,elements.canvas.height],apply(value){selector.value=value;elements['reload-resolution'].onclick();return {saved,assigned};},document,listener};
 }
 assert.deepEqual(shell('').dimensions,[1280,720]);
 assert.deepEqual(shell('', '640x480').dimensions,[640,480]);
@@ -22,3 +22,6 @@ const result=shell('?interactive=1&name=Test&ws_url=wss%3A%2F%2Fexample.com').ap
 assert.equal(result.saved,'640x480');assert(new URL(result.assigned).searchParams.get('ws_url')==='wss://example.com');assert(new URL(result.assigned).searchParams.get('res')==='640x480');
 const noStorage=shell('',null,true).apply('960x540');assert(new URL(noStorage.assigned).searchParams.get('res')==='960x540');
 console.log('PASS: default, persisted, query precedence, custom and invalid dimensions, storage denial, reload preserves connection options');
+
+assert.deepEqual(shell('?res=dynamic').dimensions,[1600,900]);
+assert.deepEqual(shell('', 'dynamic').dimensions,[1600,900]);

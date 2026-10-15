@@ -343,3 +343,272 @@ exit=1
   it with `memory access out of bounds`. Native recursion stays unchanged.
 - Browser shell, automated map/admin/travel checks and source/server evidence
   are maintained in the wrapper repository under `build/phase8/`.
+
+## Phase 9 — raw relative mouse and live resolution
+
+- SDL Emscripten mouse/pen relative paths forward browser movementX/Y unchanged;
+  absolute coordinates retain canvas scaling. Both initial lock and click regrab
+  use one explicit `requestPointerLock({unadjustedMovement: true})` helper with
+  logged adjusted-input fallback. The html5.h request's boolean was a gesture
+  deferral flag, not raw input. Web viewport now enables SDL relative mode.
+- `SDLViewport.cpp` reports float deltas at the existing IK_MouseX/IK_MouseY
+  dispatch only when `Module.debugInput` is enabled (`?debug=1` in the wrapper).
+  MouseY retains the existing negative sign; SDL drains all queued events.
+- Web launcher exposes validated `ut2004_request_resolution` with an atomic packed
+  pending request. Between RAF waits and ticks it dispatches the existing SETRES
+  viewport command and acknowledges effective dimensions to the shell. Native,
+  Node, bounded and splash loops retain their prior behavior.
+- `OpenGLRenderDevice.cpp::SetRes` retains the existing WebGL context and GPU
+  resources for windowed dimension-only changes. The ordinary ResizeViewport
+  path updates SDL/framebuffer size; the next Lock updates viewport/scissor.
+  Full resource flush/scene precache caused a measured 1,938 ms dynamic resize.
+- Wrapper shell adds live custom/preset/dynamic resolution, even snapping and
+  bounds, persisted selection, debounced viewport/DPR updates, and explicit plus
+  automatic reload fallback. Dynamic axes clamp independently to 2560x1440.
+- Reproducible pve-only Chrome acceptance harness and evidence: wrapper
+  `scripts/test-phase9.cjs`, `build/phase9/`. Final measurements are recorded in
+  the wrapper's `docs/phase9-report.md`.
+- Final pve Chrome acceptance: X totals 400 at 1.0/0.55 CSS scale, after regrab,
+  at DPR 2 and fullscreen; Y total -240. Custom 1024x600 and preset 640x480
+  render live; dynamic 1600x900 applies in 665 ms and DPR-2 portrait clamps to
+  1800x1440 in 641 ms. Explicit/automatic reload, bounded/splash and clean exits
+  pass; no page/GL/WebGL errors. Headless pve rejects unadjustedMovement with
+  NotSupportedError, exercising the logged fallback; hardware raw input is not
+  claimed. Full evidence and failed iteration history remain in `build/phase9/`.
+
+## Mobile input phase 1
+
+- Emscripten SDL pointer adapter accepts the shared kit's explicit synthetic
+  relative flag. Touch/controller look uses movementX/Y without browser pointer
+  lock or canvas-edge clipping; synthetic button presses do not request a lock.
+  Physical pointer events keep their existing path. The C struct and JS writer
+  grow together; the flag is initialized for every pointer event.
+- No joystick or audio behavior changes. SDL joystick support remains compiled,
+  while the wrapper maps standard Gamepad API input to the shipped keyboard,
+  mouse, and wheel bindings. Engine command line still includes `-nosound`.
+- Wrapper sources: `web/mobile/mobile-input.{js,css}`, `web/index.html`.
+  Verification: wrapper `scripts/test-mobile-kit.cjs`, `scripts/test-mobile1.cjs`,
+  and `scripts/test-web.cjs --interactive`; evidence in `build/mobile1/`.
+
+## Phase 10 — full game audio (OpenAL/WebAudio + Vorbis music)
+
+- `ALAudio` is linked into the browser target through Emscripten 6.0.12's own
+  WebAudio-backed `libopenal.js`/`libopenal.a`; no openal-soft fallback was
+  needed. The vendored Ogg/Vorbis decoder (`Vorbis/ogg/src/{bitwise,framing}.c`
+  and the `Vorbis/vorbis/lib` decoder set plus `vorbisfile.c`) compiles alongside
+  it. Wrapper `link-web.sh` adds those sources, `-IALAudio/Inc -IOpenAL/Inc
+  -IVorbis/{ogg,vorbis}/include`, `-lopenal`, and passes `ALAudio:alaudio` to
+  `wasm-registry.py`; header freshness now covers `ALAudio OpenAL Vorbis`.
+- `Launch/Src/LaunchEmscripten.cpp` registers the module and self-checks
+  `autoclassUALAudioSubsystem` before any package load, matching the Fire check.
+  It also forces `ALAudio.ALAudioSubsystem.UsePrecache=0` for the browser, because
+  `UALAudioSubsystem::SetViewport` would otherwise decode and upload every
+  `USound` during viewport setup, inside boot.
+- `Vorbis/ogg/include/ogg/os_types.h` gains an `__EMSCRIPTEN__` branch using
+  `<stdint.h>` typedefs, because CMake normally generates `ogg/config_types.h`
+  and this recipe compiles the sources directly. Native branches unchanged.
+- `ALAudio/Src/ALAudioCapture.cpp`: `FALAudioCaptureDevice::Init()` returns 0 on
+  Emscripten and logs it. `alcCaptureOpenDevice` would otherwise open a second
+  `AudioContext` and call `getUserMedia`; voice is out of scope (`WITH_SPEEX 0`).
+- `ALAudio/Src/ALAudioStream.cpp`: the native build decodes Ogg on a background
+  `pthread` and uploads chunks from the main thread. Emscripten has none, so
+  `FALAudioStreamManager::Init` does not create one, `Destroy` frees the stream
+  list synchronously, and `FALAudioStream::QueryStream` decodes the requested
+  chunk inline (it already runs between ticks, where Asyncify file reads are
+  legal). `FALSoundSource::Update` drains *every* processed buffer per tick
+  instead of one, so a stalled tick can still refill the queue.
+- `ALAudio/Inc/ALAudioStream.h`: `STREAM_NUMCHUNKS` 4 → 8 under `__EMSCRIPTEN__`
+  (~3 s of buffered audio) for the same reason.
+- `ALAudio/Src/ALAudioSubsystem.cpp`: with the library linked statically there is
+  no DLL to open, and `alGetProcAddress` refuses to resolve before a context
+  exists. `FindProc` therefore resolves the `ALFuncs.h` table directly against
+  the linked `libopenal` symbols under `__EMSCRIPTEN__`, using the
+  `DLLHandle = (void*)-1` sentinel that `appFreeDllHandle` already ignores for the
+  other statically-linked modules. No entry point needed a shim.
+- Same file adds the browser observability the shell and tests need: a shared
+  counter of started sounds and requeued stream buffers, `alGetError()` sampled
+  once per `UALAudioSubsystem::Update` (logging any non-zero result instead of
+  swallowing it), `alcProcessContext` replaced by an explicit
+  `AL.scheduleContextAudio` call so source state advances within the frame, the
+  OpenAL `AudioContext` published as `Module.audioContext` with an `AnalyserNode`
+  tapped onto the OpenAL master gain, and `Module.audioDebug` filled with
+  `deviceOpen/contextState/musicPlaying/queued/processed/soundsStarted/lastError/rms`.
+- Same file extends `UALAudioSubsystem::Serialize` to keep the transient
+  `QueuedSources` sounds alive across the `CollectGarbage` in `LoadMap`: a track
+  queued by `PlayMusic` during load was otherwise collectable before its first
+  tick. Native builds keep the original set.
+- Wrapper `web/index.html`: the interactive client no longer passes `-nosound`
+  (`?nosound=1` opts out; the bounded/splash probes and the Node build keep it).
+  The shell resumes the real `AudioContext` on the first `pointerdown`/`keydown`,
+  re-issuing `resume()` inside the activation window because a `resume()` issued
+  from the very first `pointerdown` can precede Chrome latching that gesture's
+  transient activation and is not retried by the browser; it suspends while
+  `document.hidden` and resumes on return, and shows "Click to enable sound" in
+  `#status` until the context runs. `Module.audioContext` is the first hook the
+  shared mobile kit already tries, so `web/mobile/mobile-input.js` is unchanged.
+- Verification: wrapper `scripts/test-phase10.cjs` (`ab`, `desktop`, `touch` modes)
+  plus `node scripts/test-phase9.cjs` against the same build; evidence, raw
+  numbers and the diagnostic scripts are in wrapper `build/phase10/`.
+
+## Phase 12 — 3374 native surface (2026-10-14)
+
+The live dedicated server runs OldUnreal's 3374 Linux patch; 3369-era data boots
+this engine but 3374 data aborted at the first unbound native
+(`Can't find 'intUObjectexecRandRange' in 'Core.dll'`). This phase enumerates the
+3374 native declarations offline, implements the client-runtime gaps, and
+makes binding failures diagnosable instead of fatal-at-first.
+
+### Enumeration (evidence: wrapper `build/phase12/`)
+
+- Offline diff: every 3374 `.u` export table is decoded and compared against the
+  generated static registry (`Launch/Src/wasm-registry.py` output). Tool: the
+  `scripts/phase12-native-census.py`; results in `missing-natives.txt` preserve the
+  original 49 runtime entries (6 Core natives, 1 Engine class + 18 functions,
+  3 IpDrv classes + 2 functions, 2 XInterface functions, 16 Onslaught classes +
+  1 function), signatures and derivation sources. The exhaustive installer-tree
+  census also records 14 editor-only classes and 14 editor-only functions not
+  linked into this client; it does not claim editor support.
+  `changed-native-signatures.json` compares existing natives across both eras:
+  PlayMusic and three debug drawing functions gained optional arguments.
+- Runtime cross-check: `WASM_VERIFY_NATIVES=1` makes binding log-and-continue and
+  sweeps the whole package set, so the runtime list can be compared against the
+  offline list. Log before the fixes: `verify-natives-before.log`.
+
+### Diagnostics
+
+- `Core/Src/UnObj.cpp` (`UPackage::GetDllExport`): under `__EMSCRIPTEN__`, when
+  `WASM_VERIFY_NATIVES` is truthy, a missing module/export is logged as a warning
+  instead of `appErrorf`. Default behaviour (env unset) is byte-for-byte the
+  original fatal path.
+- `Core/Src/UnClass.cpp`, `UClass::Bind` / `UFunction::Bind`: same gate for a
+  missing `autoclass*` constructor and for a dynamic native whose `GNatives`
+  slot is still `execUndefined` (i.e. an `iNative` the engine never registered).
+- `Launch/Src/LaunchEmscripten.cpp`: with `WASM_VERIFY_NATIVES` set, loads the
+  package set (`IpDrv`, `UWeb`, `Onslaught`, plus `Fire`/`XGame`/`XInterface`)
+  after Engine so their natives are exercised before the map load.
+
+### Implemented natives (all regular implementations, no `#if __EMSCRIPTEN__`)
+
+Reconstructed from the 3374 package signatures, shipped `.so` disassembly,
+and existing engine helpers. OldUnreal's patch source is not published;
+no unofficial source mirrors were used.
+
+- `Core/Object.uc`: `RandRange` (`Min + (Max-Min)*appFrand()`, matching the
+  `FRange::GetRand` convention), `FloatToFormattedString` (`%%.%df` with the
+  default `Decimals=2` the binary uses), `IsUTracing`/`SetUTracing` (engine-local
+  trace flag plus the reset semantics of `UObject::UTrace`),
+  `GetModName` (returns `GModName`), `AllPackageFiles` (iNative 198; iterator over
+  the engine's package path list, deduplicated, honouring the optional `FileExt`
+  and `Prefix` filters).
+- `Engine/ObjectPool` (new native class): `AllocateObject` reuses a pooled object
+  of the requested class else constructs a transient one, `FreeObject` returns an
+  object to the pool, `Shrink` empties it. The pool is a transient `UObject`.
+- `Engine/Actor.uc`: `HurtRadius` (radius query through the collision hash, line
+  check, distance-scaled `TakeDamage`, `bHurtEntry` re-entrancy guard, vehicle
+  `DriverRadiusDamage` passthrough), `TriggerEvent`/`UntriggerEvent`
+  (`Tag`-matched `Trigger`/`UnTrigger` broadcast), `AllControllers` (iNative 325;
+  walks `Level.ControllerList` with a class filter), `KRagdollExists` (no-Karma
+  build answers `false`), `ClearAttachedDecals` (`FProjectorRenderInfo::
+  RemoveReference` over `Projectors`), `DrawDebugBox` (`GTempLineBatcher`).
+- `Engine/Pawn.uc`: `AllInventory` (iNative 326; walks the inventory chain with a
+  class filter and a cycle guard, matching the binary's iterator counter).
+- `Engine/Projectile.uc`: `HurtRadius` (same shape as `AActor`'s plus the
+  `LastTouched` follow-up pass, `HurtWall` exclusion, delayed-damage instigator
+  forwarding and vehicle passthrough).
+- `Engine/LevelInfo.uc`: `GetLocalPlayerController` (cached, then local
+  viewport, then controller list — no global engine pointer dependency).
+- `Engine/GameInfo.uc`: `MakeColorCode`, `StripColor` and `FromINIFormat`
+  implemented against the same colour-code convention as the shipped
+  `FString::CreateColorCode`/`StripColorCodes`/`FromINIFormat`
+  (leading `0x1B`, channels clamped to a minimum of 1, `(#RRGGBB)` → code);
+  `GetCurrentTickRate` reads `CurrentTickRate`, maintained by the browser loop.
+  `GetConfiguredTickRate` reads `NetServerMaxTickRate` when connected, otherwise
+  client menu/offline limits (120/1000 defaults recovered from Engine.so).
+- `IpDrv`: `AMasterServerUplink::NetworkConnect` (creates and connects
+  `FMasterServerUplinkLink` exactly as the shipped `execReconnect` does),
+  `AMasterServerClientLauncher` native class + `SetResultCount`.
+- `XInterface`: `UGUIController::NotifyMenuStatus` stores the parsed 32-bit bool
+  in analyst-named `UClient::bMenuOpen`; Engine.so uses it to choose menu/offline
+  frame limits. `UGUIFont::GetFontB` sets `parm_YRes` before forwarding to GetFont.
+- `Onslaught`: the 16 native classes the package declares are compiled from the
+  in-tree sources; `AONSWheeledCraft::IMPLEMENT_CLASS` is re-enabled (its
+  on-disk registration was commented out).
+
+Module list: the Node link now covers Core, Engine, IpDrv, UWeb, Onslaught, Fire,
+XGame and XInterface; `Onslaught/Src/Onslaught.cpp` registers its names from the
+launcher under Emscripten instead of a pre-runtime global constructor.
+
+### Layout and existing-native compatibility
+
+- Compiler-owned native layout metadata anchors reflected fields in Engine,
+  IpDrv and XInterface and the 32-bit SoundData payload. Both package eras use
+  actual C++ offsets, sizes and bool masks; omitted legacy fields retain space.
+  Actor's reordered octree/NetInitialCache block is anchored field by field.
+  The failing GC reference was `DefaultPhysicsVolume.Deleted` at offset 260,
+  reading octree float bits as an object pointer.
+- PlayMusic consumes all five 3374 arguments, including zero-default fade-out,
+  crossfade and seek. Playback fades/stops existing music, clears queued tracks,
+  delays non-crossfaded playback until fade-out completes, and preserves seek.
+  The legacy two-argument bytecode still parses correctly through the normal
+  end-of-parameters handling. Raw Engine.so assembly is in the wrapper evidence.
+- DrawDebugLine/Circle/Sphere consume the new optional `staying` bool; all four
+  debug primitives, including DrawDebugBox, support persistent geometry cleared
+  by ClearStayingLines. Existing tessellation is reused.
+- Temporary layout, GC-reference and bad-opcode probes were removed.
+
+### Result
+
+- Final Node acceptance, GC enabled: 3374 **4.828257 s**, 3369 **5.385955 s**;
+  both exit 0 with initialization, NvidiaLogo browse, bounded-loop and clean-exit
+  markers. Evidence: `node-{3374,3369}-final-accepted.{log,json}`.
+- pve Chrome DM-Rankin: 3374 first frame **73473.100 ms**, 3369
+  **81189.800 ms**; both render, accept keyboard/mouse input and shut down with
+  exit 0. GL/WebGL errors are zero. Raw frames/readbacks and harness logs:
+  `browser-{3374,3369}-accepted/`.
+- Two locally served 3374 clients joined the unchanged live relay/server from
+  two windows of one pve Chrome. Spawn times **106153/104575 ms**; both transport
+  failure flags false, with signon/HUD/scoreboard evidence in
+  `local-3374-multiplayer-resolution-fix/`. No mesa browser was used.
+- The wrapper startup resize now waits for connected client state rather than
+  treating a map-loading screenshot as a ready frame. This prevents its
+  five-second resize fallback from reloading during asynchronous map loading.
+- Editor.TransBuffer remains an explicit, nonfatal editor-only import warning.
+
+## Phase 13 — exhaustive map execution
+
+- Headless startup accepts `UT2004_MAP` (map URL, including `?game=Package.Class`),
+  enables UnrealScript like the browser and native launcher, and starts a real
+  match through `NumBots`, `MinPlayers`, and `QuickStart` URL options.
+  `UT2004_HEADLESS_BOTS` defaults to 2 (0–32); `UT2004_HEADLESS_TICKS` defaults to
+  120 (1–10000). `WASM_HEADLESS_PROOF` records the actual map/game, possessed
+  bot pawns and controlled non-vehicle pawns (including scripted tutorial actors).
+- `AEmitter::PostScriptDestroyed` now frees actor-owned particle emitters even
+  for statically loaded actors with `DeleteParticleEmitters == 0`. Previously,
+  stripped actor Emitter311 left SpriteEmitter1 registered with a dangling Outer
+  on 3369 DOM-UCMP-Cerebral, crashing garbage collection at exit.
+  CTF-UCMP2-Enlightenment also retained owned children absent from its Emitters
+  array. Static-actor teardown now visits material and emitter ownership in two
+  registry passes, not a nested scan per child. Dynamic emitters retain the
+  original list-based cleanup; package-owned shared objects remain untouched.
+  Focused verification on both maps: two bot pawns, 600 ticks, exit 0, GC enabled.
+- Browser startup accepts the shell's optional local `gameClass` without changing
+  the engine's default map-to-game selection.
+- Raw census and teardown evidence: wrapper `build/phase13/`; coverage and
+  remaining acceptance results are documented in wrapper `docs/phase13-report.md`.
+- Final headless sweep: 373/373 maps reach play, finish 600 ticks, and exit zero;
+  zero native-bind failures. Authored add-on class/data errors remain visible.
+- Browser shutdown awaits fullscreen restoration and its next animation frame
+  before appPreExit destroys SDL viewport callback userdata. This fixes the
+  observed `dynCall_iiii` after-runtime-exit abort without keeping a dead runtime
+  alive or suppressing assertions.
+- Local tutorial launches use the shipped menu protocol: NumBots=0,
+  QuickStart=true, TeamScreen=false. Player evidence distinguishes a possessed
+  pawn from a real SceneManager OldPawn temporarily unpossessed by Matinee.
+  The actor scan occurs only on cinematic entry, stops at the first observed
+  handoff, and never scans every frame. Final compiled TUT-DM smoke passes with
+  the observed OldPawn, rendered scene, zero GL/page errors and exit 0
+  (`build/phase13/renderer-fix-smoke/` in the wrapper).
+- Pve Chrome focused verification: DM-Rankin and TUT-DM both render with zero
+  GL/page errors, observe real pawn possession/handoff, and exit zero including
+  a one-second asynchronous teardown observation window.
+  Evidence: wrapper `build/phase13/browser-fix-smoke/`.

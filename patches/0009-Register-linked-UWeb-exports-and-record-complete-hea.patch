@@ -1,7 +1,7 @@
 From e10e60e63380fccc8a0890332b656961c584c35e Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 09:25:33 -0700
-Subject: [PATCH 09/16] Register linked UWeb exports and record complete
+Subject: [PATCH 09/26] Register linked UWeb exports and record complete
  headless boot
 
 ---

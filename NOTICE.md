@@ -12,7 +12,7 @@ Original code and documentation produced for the UT2004 → WebAssembly port:
   own GitHub patch releases). That script downloads into the user's own
   directories; it does not re-host, bundle, or redistribute any game content.
 - technical reports and the port changelog (`docs/`),
-- a **21-patch source series** (`patches/`) that adapts the pinned community
+- a **26-patch source series** (`patches/`) that adapts the pinned community
   engine tree for Emscripten and supports 3374-preview-23 plus legacy 3369.
 
 ## What this repository does NOT contain
@@ -46,17 +46,18 @@ CD/DVD copy you own, a store copy you already own, or the community
 redistribution maintained by the OldUnreal project (which distributes game
 installers under an agreement with Epic Games).
 
-The v0.1.0 release client is verified with the final official **3369-era data**
+The v0.2.0 release client is verified with the final official **3369-era data**
 (legacy support) and **OldUnreal 3374-preview-23**. Compatibility is limited
 to these tested package sets; it does not imply compatibility with every later
 community patch.
 
 ## Release binaries
 
-The v0.1.0 web and Node release assets (first public release) contain compiled engine code only — no
+The v0.2.0 web and Node release assets (current release; first public release was v0.1.0) contain compiled engine code only — no
 game content — and are provided for personal use with your own legally obtained
-game data. The complete 21-patch public source series includes the Phase 12
-3374 native and layout compatibility work while preserving final 3369 support.
+game data. The complete 26-patch public source series includes the Phase 12
+3374 native and layout compatibility work (preserving final 3369 support) and
+the Phase 13 map-coverage fixes.
 
 ## Third-party components
 

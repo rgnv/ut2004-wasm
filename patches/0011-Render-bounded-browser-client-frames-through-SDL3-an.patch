@@ -1,7 +1,7 @@
 From 094b2f37492d51f0f1be85b021447f4a7fe321ef Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 10:21:11 -0700
-Subject: [PATCH 11/16] Render bounded browser client frames through SDL3 and
+Subject: [PATCH 11/26] Render bounded browser client frames through SDL3 and
  GL4ES
 
 ---

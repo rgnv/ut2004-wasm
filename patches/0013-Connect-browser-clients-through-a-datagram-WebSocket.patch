@@ -1,7 +1,7 @@
 From b84e0b0ecbf9eabc8b98732ea070a0257522cca6 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 11:10:25 -0700
-Subject: [PATCH 13/16] Connect browser clients through a datagram WebSocket
+Subject: [PATCH 13/26] Connect browser clients through a datagram WebSocket
  transport
 
 ---

@@ -3,7 +3,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>UT2004 — browser client</title>
 <link rel="icon" href="data:,">
-<link rel="preload" href="ut2004.wasm?v=mobile1-relative-input" as="fetch" crossorigin>
+<link rel="preload" href="ut2004.wasm?v=phase13c-menu" as="fetch" crossorigin>
 <link rel="stylesheet" href="../assets/mobile-input.css?v=mobile1">
 <script src="../assets/mobile-input.js?v=mobile1"></script>
 <style>
@@ -181,7 +181,7 @@ var Module = {
   dataBaseURL: location.pathname.startsWith('/ut2004/') ? '/ut2004/data/' : '/data3369/UT2004/',
   playerName: options.get('name') || 'WasmPlayer',
   relayURL: options.get('ws_url') || 'wss://games.rgnv.dev/ut2004b/connect2',
-  locateFile: (path, prefix) => prefix + path + (path.endsWith('.wasm') ? '?v=mobile1-relative-input' : ''),
+  locateFile: (path, prefix) => prefix + path + (path.endsWith('.wasm') ? '?v=phase13c-menu' : ''),
   debugInput: options.get('debug') === '1',
   audioDebug: options.get('debug') === '0' ? null : {
     deviceOpen: false, contextState: 'closed', musicPlaying: false,
@@ -312,6 +312,9 @@ if (window.mobileInput.enabled) {
   picker.value = [requestedMap, savedMap, 'DM-Rankin'].find(map => maps.includes(map));
   Module.map = Module.connect ? 'DM-Rankin' : picker.value;
   Module.localMap = !Module.connect && !!requestedMap;
+  const requestedGame = options.get('game');
+  if (requestedGame && !/^[A-Za-z_]\w*\.[A-Za-z_]\w*$/.test(requestedGame)) throw Error('Invalid game class: ' + requestedGame);
+  Module.gameClass = Module.localMap ? requestedGame : null;
   if (requestedMap) { try { localStorage.setItem('ut2004-map', requestedMap); } catch (_) {} }
   picker.disabled = false;
   const playMap = document.getElementById('play-map');

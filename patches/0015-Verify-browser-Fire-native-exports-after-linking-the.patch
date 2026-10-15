@@ -1,7 +1,7 @@
 From b0a3d106d8ea3ed1a1ebfac538b45300538c948b Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 16:12:08 -0700
-Subject: [PATCH 15/16] Verify browser Fire native exports after linking the
+Subject: [PATCH 15/26] Verify browser Fire native exports after linking the
  real texture module
 
 ---

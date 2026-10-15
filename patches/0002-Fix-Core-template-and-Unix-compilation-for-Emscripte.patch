@@ -1,7 +1,7 @@
 From 41ba865d7575f316444ed830ebbaf5363cdc9019 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 08:09:33 -0700
-Subject: [PATCH 02/16] Fix Core template and Unix compilation for Emscripten
+Subject: [PATCH 02/26] Fix Core template and Unix compilation for Emscripten
 
 ---
  CHANGES-wasm-port.md  |  21 ++++++++

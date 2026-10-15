@@ -1,7 +1,7 @@
 From ed8d1aaa9338779df6056832efa97ceb5abf5f44 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 10:37:43 -0700
-Subject: [PATCH 12/16] Run interactive browser frames and load DM-Rankin
+Subject: [PATCH 12/26] Run interactive browser frames and load DM-Rankin
  through engine startup
 
 ---

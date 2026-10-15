@@ -1,0 +1,58 @@
+From b44cac4beb413d30a3c7636e3613c363ae62e922 Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Wed, 14 Oct 2026 23:45:16 -0700
+Subject: [PATCH 26/26] Open configured menu on direct browser Entry startup
+ and expose GUI state
+
+---
+ Launch/Src/LaunchEmscripten.cpp | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 95620cd..3494134 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -13,6 +13,7 @@
+ extern "C" void RegisterNamesOnslaught(void);
+ extern "C" void RegisterNamesXInterface(void);
+ #if defined(UT2004_WEB_CLIENT)
++#include "XInterface.h"
+ static unsigned PendingResolution;
+ extern "C" EMSCRIPTEN_KEEPALIVE int ut2004_request_resolution(int w, int h)
+ {
+@@ -185,6 +186,15 @@ int main(int argc, char** argv)
+             EM_ASM({ stringToUTF8((Module.playerName || 'WasmPlayer').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48), $0, $1); }, Name, sizeof(Name));
+             Engine->Exec(*FString::Printf(TEXT("open 127.0.0.1?Name=%s"), Name), *GLog);
+         }
++        // Entry is a menu host, not a playable level. Normal cinematic travel
++        // opens MainMenuClass explicitly; a direct URL bypasses that handoff.
++        if (LocalMap && !appStricmp(Map, TEXT("Entry")) && Engine->Client &&
++            Engine->Client->Viewports.Num()) {
++            UViewport* Viewport = Engine->Client->Viewports(0);
++            Viewport->GUIController->eventOpenMenu(
++                *((UGameEngine*)Engine)->MainMenuClass, TEXT(""), TEXT(""));
++            debugf(NAME_Init, TEXT("WASM: direct Entry opened configured main menu"));
++        }
+         GIsRunning = 1;
+         // Only the dedicated 3369 relay opts into the shared admin login.
+         const UBOOL AutoAdmin = EM_ASM_INT({ return Module.connect && Module.relayURL === 'wss://games.rgnv.dev/ut2004b/connect2' ? 1 : 0; });
+@@ -267,11 +277,14 @@ int main(int argc, char** argv)
+                         }
+                     }
+                 }
+-                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7, netMode: $8, admin: !!$9, cinematic: !!$10, cinematicPawnSpawned: !!$11}); },
++                UGUIController* GUI = Cast<UGUIController>(Engine->Client->Viewports(0)->GUIController);
++                EM_ASM({ Module.playerState = ({tick: $0, position: [$1,$2,$3], rotation: [$4,$5,$6], pawn: !!$7, netMode: $8, admin: !!$9, cinematic: !!$10, cinematicPawnSpawned: !!$11, guiActive: !!$12, menuClass: UTF8ToString($13), level: UTF8ToString($14)}); },
+                     Frame, Target->Location.X, Target->Location.Y, Target->Location.Z,
+                     Player->Rotation.Pitch, Player->Rotation.Yaw, Player->Rotation.Roll, Player->Pawn != NULL, Player->Level->NetMode,
+                     Player->PlayerReplicationInfo && Player->PlayerReplicationInfo->bAdmin,
+-                    Player->bViewingMatineeCinematic, CinematicPawnSpawned);
++                    Player->bViewingMatineeCinematic, CinematicPawnSpawned,
++                    GUI && GUI->bActive, GUI && GUI->ActivePage ? GUI->ActivePage->GetClass()->GetName() : TEXT(""),
++                    Player->GetLevel()->GetOuter()->GetName());
+             }
+         }
+         GIsRunning = 0;
+-- 
+2.47.3
+

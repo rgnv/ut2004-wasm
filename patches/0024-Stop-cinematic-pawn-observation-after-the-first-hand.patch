@@ -1,0 +1,45 @@
+From 70d6e09e2650fde750dc56a8d62c273b14eafaae Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@rgnv.dev>
+Date: Wed, 14 Oct 2026 16:04:28 -0700
+Subject: [PATCH 24/26] Stop cinematic pawn observation after the first handoff
+
+---
+ CHANGES-wasm-port.md            | 5 ++++-
+ Launch/Src/LaunchEmscripten.cpp | 4 +++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/CHANGES-wasm-port.md b/CHANGES-wasm-port.md
+index dddb0ec..02a5796 100644
+--- a/CHANGES-wasm-port.md
++++ b/CHANGES-wasm-port.md
+@@ -604,7 +604,10 @@ launcher under Emscripten instead of a pre-runtime global constructor.
+ - Local tutorial launches use the shipped menu protocol: NumBots=0,
+   QuickStart=true, TeamScreen=false. Player evidence distinguishes a possessed
+   pawn from a real SceneManager OldPawn temporarily unpossessed by Matinee.
+-  The actor scan occurs only on cinematic entry, not every frame.
++  The actor scan occurs only on cinematic entry, stops at the first observed
++  handoff, and never scans every frame. Final compiled TUT-DM smoke passes with
++  the observed OldPawn, rendered scene, zero GL/page errors and exit 0
++  (`build/phase13/renderer-fix-smoke/` in the wrapper).
+ - Pve Chrome focused verification: DM-Rankin and TUT-DM both render with zero
+   GL/page errors, observe real pawn possession/handoff, and exit zero including
+   a one-second asynchronous teardown observation window.
+diff --git a/Launch/Src/LaunchEmscripten.cpp b/Launch/Src/LaunchEmscripten.cpp
+index 387d390..95620cd 100644
+--- a/Launch/Src/LaunchEmscripten.cpp
++++ b/Launch/Src/LaunchEmscripten.cpp
+@@ -260,8 +260,10 @@ int main(int argc, char** argv)
+                         AActor* Actor = Level->Actors(I);
+                         if (Actor && Actor->IsA(ASceneManager::StaticClass())) {
+                             ASceneManager* Scene = (ASceneManager*)Actor;
+-                            if (Scene->Viewer == Player && Scene->OldPawn)
++                            if (Scene->Viewer == Player && Scene->OldPawn) {
+                                 CinematicPawnSpawned = 1;
++                                break;
++                            }
+                         }
+                     }
+                 }
+-- 
+2.47.3
+

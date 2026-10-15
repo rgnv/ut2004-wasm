@@ -3,6 +3,13 @@
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 mkdir -p "$ROOT/build/logs" "$ROOT/build/web"
+# Retain the local GL4ES correction without requiring an unpublished dependency fork.
+GL4ES_PATCH="$ROOT/patches/gl4es-texture-realization.patch"
+if git -C "$ROOT/src/gl4es" apply --check "$GL4ES_PATCH"; then
+  git -C "$ROOT/src/gl4es" apply "$GL4ES_PATCH"
+else
+  git -C "$ROOT/src/gl4es" apply --reverse --check "$GL4ES_PATCH"
+fi
 # Pin the phase-1 SDK (Emscripten 6.0.12).
 SDK=emscripten/emsdk@sha256:77638e6c215a65f25a704c0c831d5c2463a8c0468a58c6cb82489dbe621dfa05
 docker run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp \
@@ -69,8 +76,11 @@ for src in ALAudio/Src/*.cpp; do compile "$src" alaudio ALAudio; done
 compile Launch/Src/LaunchEmscripten.cpp launch Launch
 python3 Launch/Src/wasm-registry.py "$OBJ" /work/build/web-obj/WasmRegistry.cpp SDLDrv:sdl_drv OpenGLDrv:opengl_drv XGame XInterface Fire ALAudio:alaudio Onslaught
 compile /work/build/web-obj/WasmRegistry.cpp launch Launch
+# Terrain/client-array draws can exceed Emscripten's 2 MiB default. Buffers stay
+# lazily allocated; this extends the supported size classes, not upfront GPU use.
 em++ "${objects[@]}" /work/build/web-sdl/libSDL3.a /work/src/gl4es/lib/libGL.a -lopenal \
   -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=1 \
+  -sGL_MAX_TEMP_BUFFER_SIZE=67108864 \
   -sASYNCIFY=1 -sASYNCIFY_IMPORTS=wasi_snapshot_preview1.fd_read -sASYNCIFY_STACK_SIZE=1048576 -sGL_ENABLE_GET_PROC_ADDRESS=1 -sFULL_ES2=1 -sENVIRONMENT=web --pre-js /work/web/pre.js --js-library /work/web/http-library.js -sASSERTIONS=1 -fexceptions -sNO_DISABLE_EXCEPTION_CATCHING=1 -sSTACK_SIZE=8388608 -Wl,--allow-multiple-definition -Wl,--error-limit=0 -O1 -g2 \
   -o /work/build/web/ut2004.js
 touch "$STAMP"
@@ -80,7 +90,6 @@ brotli -q 11 -f -o "$ROOT/build/web/ut2004.wasm.br" "$ROOT/build/web/ut2004.wasm
 gzip -9 -n -c "$ROOT/build/web/ut2004.wasm" > "$ROOT/build/web/ut2004.wasm.gz"
 python3 "$ROOT/scripts/web-manifest.py" --data "${UT2004_DATA:-$ROOT/data3374}"
 cp "$ROOT"/web/index.html "$ROOT/build/web/"
-mkdir -p "$ROOT/build/assets" "$ROOT/build/web/assets"
+mkdir -p "$ROOT/build/assets"
 cp "$ROOT"/web/mobile/mobile-input.{js,css} "$ROOT/build/assets/"
-cp "$ROOT"/web/mobile/mobile-input.{js,css} "$ROOT/build/web/assets/"
 printf 'LINK OK: build/web/ut2004.js + build/web/ut2004.wasm\n'

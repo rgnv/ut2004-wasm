@@ -5,7 +5,9 @@ const WebSocket = require('ws');
 const [port = '19228', mode = 'osiris', name = 'Phase7bOsiris', out = 'build/phase7b'] = process.argv.slice(2);
 const joining = ['join', 'admin', 'default'].includes(mode);
 const map = mode === 'osiris' ? 'DM-DE-Osiris2' : mode.replace(/^picker:/, '');
-const screenshots = joining || mode === 'osiris' || mode.startsWith('picker:') || ['DM-Corrugation', 'DOM-Suntemple'].includes(map);
+const menuMaps = new Set(['Entry', 'MOV-UT2004-Intro', 'Mov-UT2-intro', 'NoIntro', 'NvidiaLogo']);
+const menuRole = !joining && menuMaps.has(map);
+const screenshots = menuRole || process.env.UT_MAP_SCREENSHOTS === '1' || joining || mode === 'osiris' || mode.startsWith('picker:') || ['DM-Corrugation', 'DOM-Suntemple'].includes(map);
 fs.mkdirSync(out, {recursive:true});
 const delay = ms => new Promise(r => setTimeout(r, ms));
 const clients = [];
@@ -36,17 +38,27 @@ async function attach(port, name) {
     while (!await c.eval(expression)) { assert(Date.now()-start < timeout, name+' timeout '+expression); assert.equal(failures.length,0,JSON.stringify(failures)); if (expression !== '!!window.bootResult') assert(!await c.eval('window.bootResult'), name+' engine exited'); await delay(300); }
   };
   c.key = async (type, key, code, windowsVirtualKeyCode) => c.cdp('Input.dispatchKeyEvent',{type,key,code,windowsVirtualKeyCode});
-  c.capture = async name => {
+  c.capture = async (name, transient = false) => {
     const previous = await c.eval('Module.frameCount');
     await c.eval('Module.captureRequested=true'); await c.until(`window.frameEvidence?.frames > ${previous}`);
     const state = await c.eval(`({url:location.href, player:Module.playerState, frame:window.frameEvidence, png:${screenshots ? 'window.lastFramePNG' : 'null'}})`);
-    assert.equal(state.player.netMode,joining ? 3 : 0); assert(state.player.pawn); assert.equal(state.frame.glErrors,0); assert.equal(state.frame.webglErrors,0); assert(state.frame.uniqueColors>32);
+    assert.equal(state.player.netMode,joining ? 3 : 0);
+    if (!menuRole) assert(state.player.pawn || (state.player.cinematic && state.player.cinematicPawnSpawned), 'possessed pawn or observed Matinee OldPawn');
+    assert.equal(state.frame.glErrors,0); assert.equal(state.frame.webglErrors,0);
+    if (!transient) {
+      assert(state.frame.uniqueColors>32);
+      if (menuRole) {
+        assert(state.player.guiActive && state.player.menuClass === 'UT2k4MainMenuWS', 'configured native main menu active');
+        assert(state.frame.meanRGB > 5 && state.frame.rgbNonzero > state.frame.width * state.frame.height / 4, 'substantial rendered menu');
+      }
+    }
     if (screenshots) fs.writeFileSync(`${out}/${c.name}-${name}-canvas.png`, Buffer.from(state.png.split(',')[1],'base64'));
     delete state.png;
     fs.writeFileSync(`${out}/${c.name}-${name}.json`,JSON.stringify(state,null,2));
-    if (!screenshots) return;
+    if (!screenshots) return state;
     const shot=await c.cdp('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
     fs.writeFileSync(`${out}/${c.name}-${name}.png`,Buffer.from(shot.data,'base64'));
+    return state;
   };
   await c.cdp('Runtime.enable'); await c.cdp('Network.enable'); await c.cdp('Page.enable');
   await c.cdp('Network.setCacheDisabled',{cacheDisabled:false});
@@ -62,7 +74,8 @@ async function attach(port, name) {
   `});
   await c.cdp('Page.navigate',{url:'about:blank'}); await delay(500);
   log.length=0; failures.length=0;
-  c.started=Date.now(); c.url=`https://games.rgnv.dev/ut2004/?interactive=1&res=640x480&${joining ? 'connect=1&' : mode === 'osiris' || mode.startsWith('picker:') ? '' : 'map='+encodeURIComponent(map)+'&'}name=${name}`;
+  c.started=Date.now(); c.url=`${process.env.UT_MAP_BASE || 'https://games.rgnv.dev/ut2004/'}?interactive=1&res=640x480&${joining ? 'connect=1&' : mode === 'osiris' || mode.startsWith('picker:') ? '' : 'map='+encodeURIComponent(map)+'&'}name=${name}`;
+  if (process.env.UT_MAP_GAME) c.url += '&game=' + encodeURIComponent(process.env.UT_MAP_GAME);
   if (mode === 'default') c.url=`https://games.rgnv.dev/ut2004/?res=640x480&name=${name}`;
   log.push('LIVE URL '+c.url);
   await c.cdp('Page.navigate',{url:c.url});
@@ -76,13 +89,49 @@ async function spawn(c, afterTravel = false) {
   await c.eval('Module.canvas.focus()');
   if (joining && !afterTravel) { await c.key('keyDown','Escape','Escape',27); await c.key('keyUp','Escape','Escape',27); }
   const rect=await c.eval('({x:Module.canvas.getBoundingClientRect().x+320,y:Module.canvas.getBoundingClientRect().y+240})');
-  for(let i=0; !await c.eval('!!Module.playerState?.pawn'); i++) {
+  for(let i=0; !await c.eval('!!Module.playerState?.pawn || (Module.playerState?.cinematic && Module.playerState?.cinematicPawnSpawned)'); i++) {
     assert(i<90,c.name+' spawn timeout');
     await c.cdp('Input.dispatchMouseEvent',{type:'mousePressed',...rect,button:'left',clickCount:1}); await delay(300);
     await c.cdp('Input.dispatchMouseEvent',{type:'mouseReleased',...rect,button:'left',clickCount:1}); await delay(700);
   }
   c.spawnMs=Date.now()-c.started;
+  if (await c.eval('!!Module.playerState?.cinematic'))
+    await c.until('(Module.captureRequested=true, window.frameEvidence?.uniqueColors>32)',30000);
   await c.capture('ingame'); console.log(c.name,'SPAWNED',c.spawnMs,'ms; first frame',c.firstFrame);
+}
+async function observeMenu(c) {
+  c.firstFrame = await c.eval('window.frameEvidence.elapsedMs');
+  c.series = [];
+  const start = Date.now();
+  // Observe authored playback without the pawn-spawn loop's repeated clicks.
+  // CinematicPlayer's documented Fire action may then skip to the main menu.
+  for (let i = 0; i < 12; i++) {
+    const state = await c.capture('flow-' + i, true);
+    c.series.push({atMs: Date.now() - start, ...state});
+    if (state.player.guiActive && state.player.menuClass === 'UT2k4MainMenuWS') break;
+    await delay(2000);
+  }
+  const rendered = c.series.filter(s => s.frame.uniqueColors > 32 && s.frame.meanRGB > 1 && s.frame.rgbNonzero > 10000);
+  assert(rendered.length, 'authored flow produced a nonblack frame before any skip input');
+  c.transition = 'automatic';
+  if (!await c.eval("Module.playerState.guiActive && Module.playerState.menuClass === 'UT2k4MainMenuWS'")) {
+    assert.notEqual(map, 'Entry', 'Entry must open its menu without input');
+    c.transition = 'CinematicPlayer.Fire skip';
+    await c.eval('Module.canvas.focus()');
+    const rect = await c.eval('({x:Module.canvas.getBoundingClientRect().x+320,y:Module.canvas.getBoundingClientRect().y+240})');
+    await c.cdp('Input.dispatchMouseEvent', {type:'mousePressed', ...rect, button:'left', clickCount:1});
+    await c.cdp('Input.dispatchMouseEvent', {type:'mouseReleased', ...rect, button:'left', clickCount:1});
+  }
+  await c.until("Module.playerState.guiActive && Module.playerState.menuClass === 'UT2k4MainMenuWS'", 120000);
+  for (let i = 0; i < 3; i++) {
+    await delay(2000);
+    c.series.push({atMs:Date.now()-start, ...await c.capture('menu-' + i)});
+  }
+  for (let i = 1; i < c.series.length; i++) {
+    assert(c.series[i].player.tick > c.series[i-1].player.tick, 'engine ticks advance');
+    assert(c.series[i].frame.frames > c.series[i-1].frame.frames, 'rendered frames advance');
+  }
+  fs.writeFileSync(`${out}/${name}-series.json`, JSON.stringify({transition:c.transition, samples:c.series}, null, 2));
 }
 (async()=>{
   const c=await attach(Number(port),name);
@@ -103,9 +152,10 @@ async function spawn(c, afterTravel = false) {
     }
     await delay(3000);
   }
-  await spawn(c);
+  if (menuRole) await observeMenu(c); else await spawn(c);
   if (!joining) {
     assert(c.log.some(line => line.toLowerCase().includes(('Bringing Level '+map+'.myLevel up for play').toLowerCase())), 'map reached play');
+    if (process.env.UT_MAP_GAME) assert(c.log.some(line => line.includes("Game class is '" + process.env.UT_MAP_GAME.split('.').pop() + "'")), 'requested game class loaded');
     const picker = await c.eval('({maps:[...document.getElementById("map").options].map(o=>o.value),manifest:Object.keys(Module.fileSizes).filter(p=>/^Maps\\/[^/]+\\.ut2$/i.test(p)).map(p=>p.slice(5,-4)),saved:localStorage.getItem("ut2004-map")})');
     assert.deepEqual([...picker.maps].sort(), [...picker.manifest].sort());
     fs.writeFileSync(`${out}/${name}-picker.json`,JSON.stringify(picker,null,2));
@@ -142,9 +192,24 @@ async function spawn(c, afterTravel = false) {
   }
   assert.equal(c.failures.length,0,JSON.stringify(c.failures));
   await c.eval('window.__shutdown()'); await c.until('!!window.bootResult');
+  await delay(1000); // Include asynchronous fullscreen/SDL teardown callbacks.
+  assert.equal(c.failures.length,0,JSON.stringify(c.failures));
   assert.deepEqual(await c.eval('window.bootResult'),{type:'exit',code:0});
-  console.log('PASS: '+mode+' reached play, spawned, rendered, clean exit');
-})().catch(e=>{console.error(e);process.exitCode=1;}).finally(async()=>{
+  assert.equal(await c.eval('document.fullscreenElement === null'), true, 'fullscreen exited before runtime teardown');
+  console.log('PASS: '+mode+' reached play, '+(menuRole ? 'rendered authored flow and stable native main menu' : 'spawned and rendered')+', clean exit');
+  fs.writeFileSync(`${out}/${name}-result.json`, JSON.stringify({map, acceptanceClass:menuRole ? 'cinematic-menu' : 'pawn', transition:c.transition, samples:c.series?.length, game:process.env.UT_MAP_GAME || null, firstFrameMs:c.firstFrame, spawnMs:c.spawnMs, pageErrors:c.failures, exit:await c.eval('window.bootResult')}, null, 2));
+})().catch(async e=>{
+  console.error(e); process.exitCode=1;
+  for (const c of clients) {
+    const failure = {error:String(e.stack || e), pageErrors:c.failures};
+    try {
+      failure.state = await c.eval('({url:location.href,bootResult:window.bootResult,player:window.Module?.playerState,frame:window.frameEvidence})');
+      const shot = await c.cdp('Page.captureScreenshot',{format:'png'});
+      fs.writeFileSync(`${out}/${c.name}-failure.png`,Buffer.from(shot.data,'base64'));
+    } catch (captureError) { failure.captureError=String(captureError); }
+    fs.writeFileSync(`${out}/${c.name}-failure.json`,JSON.stringify(failure,null,2));
+  }
+}).finally(async()=>{
   for(const c of clients) {
     fs.writeFileSync(`${out}/${c.name}-console.log`,c.log.join('\n')+'\n');
     try {await c.cdp('Page.navigate',{url:'about:blank'});} catch {} c.ws.close();

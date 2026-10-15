@@ -1,7 +1,7 @@
 From b5629e960c67546ca9ac457f8b15dd0a6d193aa5 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Tue, 13 Oct 2026 15:52:01 -0700
-Subject: [PATCH 14/16] Preserve wasm framebuffer resolution during browser
+Subject: [PATCH 14/26] Preserve wasm framebuffer resolution during browser
  layout changes
 
 ---

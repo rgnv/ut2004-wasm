@@ -20,10 +20,19 @@
 .mobile-input-button[data-id=prev] { right:132px; bottom:144px }
 .mobile-input-cursor { position:absolute; transform:translate(-50%,-50%); color:#fff; text-shadow:1px 1px #000; font:bold 28px monospace; pointer-events:none }
 .mobile-input-menu .mobile-input-look { inset:0 }
-.mobile-input-menu .mobile-input-stick, .mobile-input-menu .mobile-input-button:not([data-id=escape]) { display:none }
+.mobile-input-menu .mobile-input-stick, .mobile-input-menu .mobile-input-button:not([data-id=escape]):not([data-id=enter]):not([data-id^=nav]) { display:none }
 .mobile-input-toast { position:absolute; left:50%; top:56px; transform:translateX(-50%); z-index:6; padding:8px; max-width:90%; background:#102536ee; color:white; font:14px system-ui; line-height:1.3; pointer-events:none }
 @media (orientation:portrait) { .mobile-input-host { min-height:360px; display:flex; align-items:center; background:#000 } }
 @media (orientation:landscape) and (max-height:600px) {
   .mobile-input-host { height:100svh; min-height:0; display:flex; align-items:center; justify-content:center }
   .mobile-input-host canvas { width:min(100%, calc(100svh * var(--aspect))); max-height:100svh }
 }
+
+.mobile-input-fullscreen { top:max(54px,env(safe-area-inset-top)); left:max(8px,env(safe-area-inset-left)) }
+.mobile-input-button[data-id=enter] { left:140px; bottom:max(20px,env(safe-area-inset-bottom)) }
+.mobile-input-button[data-id^=nav] { display:none; width:44px; height:44px }
+.mobile-input-menu .mobile-input-button[data-id^=nav] { display:block }
+.mobile-input-button[data-id=navup] { left:60px; bottom:112px }
+.mobile-input-button[data-id=navdown] { left:60px; bottom:20px }
+.mobile-input-button[data-id=navleft] { left:12px; bottom:66px }
+.mobile-input-button[data-id=navright] { left:108px; bottom:66px }
